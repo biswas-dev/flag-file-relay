@@ -1,0 +1,83 @@
+# flag-file-relay — offline feature-flag relay for blue-stack.
+# Deploy into the `blues` namespace, then point services' relayProxyUrl at
+# http://flag-file-relay.blues.svc.cluster.local:8080 (see README "switch modes").
+#
+# The flag data lives in the ConfigMap below. Edit it with the `flagctl` wrapper
+# (or `kubectl edit cm flag-file-relay-flags`); the relay hot-reloads within ~1m.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: flag-file-relay-flags
+  namespace: blues
+data:
+  flags.yaml: |
+    # value = default; tenants/users = optional per-context overrides.
+    flags:
+      new-rbac:
+        value: false
+        tenants:
+          dev.elastio.saic.com: true
+          prod.elastio.saic.com: true
+      new-alerts:
+        value: false
+        tenants:
+          prod.elastio.saic.com: true
+      asset-health-precomputed-read:
+        value: false
+        tenants:
+          prod.elastio.saic.com: true
+      notification-rules: false
+      new-policies: false
+      new-jobstatus-switch: false
+      blue-stack-service-catalog-notifications: false
+      blue-stack-service-jobstatus-notifications: false
+      Process-resync-job-by-bs-service: false
+      max-amount-of-report-schedules:
+        value: 15
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: flag-file-relay
+  namespace: blues
+  labels: { app: flag-file-relay }
+spec:
+  replicas: 2
+  selector:
+    matchLabels: { app: flag-file-relay }
+  template:
+    metadata:
+      labels: { app: flag-file-relay }
+    spec:
+      containers:
+        - name: flag-file-relay
+          # Load this image into the customer's private registry first
+          # (it must not be pulled from any external host in an air-gapped env).
+          image: docker.io/anchoo2kewl/flag-file-relay:v0.1.0
+          args: ["serve"]
+          env:
+            - { name: FLAGS_FILE, value: /etc/flags/flags.yaml }
+            - { name: PORT, value: "8080" }
+          ports:
+            - { containerPort: 8080 }
+          volumeMounts:
+            - { name: flags, mountPath: /etc/flags, readOnly: true }
+          readinessProbe:
+            httpGet: { path: /health, port: 8080 }
+            initialDelaySeconds: 2
+          resources:
+            requests: { cpu: 10m, memory: 16Mi }
+            limits: { cpu: 100m, memory: 64Mi }
+      volumes:
+        - name: flags
+          configMap: { name: flag-file-relay-flags }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: flag-file-relay
+  namespace: blues
+spec:
+  selector: { app: flag-file-relay }
+  ports:
+    - { port: 8080, targetPort: 8080 }

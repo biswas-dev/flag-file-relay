@@ -1,0 +1,20 @@
+image:
+  repository: docker.io/anchoo2kewl/flag-file-relay
+  tag: v0.1.0
+  pullPolicy: IfNotPresent
+replicas: 2
+port: 8080
+# Optional: require this key on SDK requests. Empty = accept any (in-cluster only).
+sdkKey: ""
+# The flag data. Edit here (helm upgrade) or via `flagctl` against the ConfigMap.
+# value = default; tenants/users = optional per-context overrides.
+flags:
+  new-rbac:
+    value: false
+  new-alerts:
+    value: false
+  notification-rules:
+    value: false
+resources:
+  requests: { cpu: 10m, memory: 16Mi }
+  limits: { cpu: 100m, memory: 64Mi }

@@ -1,0 +1,25 @@
+# Offline feature flags for blue-stack — managed with `flag-file-relay` CLI.
+# `value` is the default; `tenants`/`users` are optional per-context overrides.
+# Seeded from the SAIC environment's intended values.
+flags:
+  new-rbac:
+    value: false
+    tenants:
+      dev.elastio.saic.com: true
+      prod.elastio.saic.com: true
+  new-alerts:
+    value: false
+    tenants:
+      prod.elastio.saic.com: true
+  asset-health-precomputed-read:
+    value: false
+    tenants:
+      prod.elastio.saic.com: true
+  notification-rules: false
+  new-policies: false
+  new-jobstatus-switch: false
+  blue-stack-service-catalog-notifications: false
+  blue-stack-service-jobstatus-notifications: false
+  Process-resync-job-by-bs-service: false
+  max-amount-of-report-schedules:
+    value: 15

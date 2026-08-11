@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# flagctl — view/edit offline feature flags stored in the flag-file-relay
+# ConfigMap. The relay hot-reloads changes within ~1 minute (no restart).
+#
+#   flagctl list                                  # all flags + values
+#   flagctl get new-rbac                           # one flag
+#   flagctl set new-rbac true                      # global default
+#   flagctl set new-rbac true --tenant acme.example.com
+#   flagctl set new-rbac false --user someone@example.com
+#
+# Env: NS (blues), CM (flag-file-relay-flags), BIN (flag-file-relay in PATH).
+set -euo pipefail
+NS="${NS:-blues}"; CM="${CM:-flag-file-relay-flags}"; BIN="${BIN:-flag-file-relay}"
+command -v "$BIN" >/dev/null || { echo "need the 'flag-file-relay' binary in PATH (it's in the bundle)"; exit 1; }
+tmp="$(mktemp)"; trap 'rm -f "$tmp"' EXIT
+kubectl -n "$NS" get cm "$CM" -o jsonpath='{.data.flags\.yaml}' > "$tmp"
+case "${1:-}" in
+  list|get) FLAGS_FILE="$tmp" "$BIN" "$@";;
+  set) FLAGS_FILE="$tmp" "$BIN" "$@"
+       kubectl -n "$NS" create cm "$CM" --from-file=flags.yaml="$tmp" --dry-run=client -o yaml | kubectl -n "$NS" apply -f - >/dev/null
+       echo "applied — relay reloads within ~1m";;
+  *) echo "usage: flagctl list | get <flag> | set <flag> <value> [--tenant T|--user U]"; exit 1;;
+esac

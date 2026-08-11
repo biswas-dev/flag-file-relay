@@ -1,0 +1,33 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}
+  labels: { app: {{ .Release.Name }} }
+spec:
+  replicas: {{ .Values.replicas }}
+  selector:
+    matchLabels: { app: {{ .Release.Name }} }
+  template:
+    metadata:
+      labels: { app: {{ .Release.Name }} }
+      annotations:
+        checksum/flags: {{ toYaml .Values.flags | sha256sum }}
+    spec:
+      containers:
+        - name: relay
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["serve"]
+          env:
+            - { name: FLAGS_FILE, value: /etc/flags/flags.yaml }
+            - { name: PORT, value: "{{ .Values.port }}" }
+            - { name: SDK_KEY, value: "{{ .Values.sdkKey }}" }
+          ports: [{ containerPort: {{ .Values.port }} }]
+          volumeMounts:
+            - { name: flags, mountPath: /etc/flags, readOnly: true }
+          readinessProbe:
+            httpGet: { path: /health, port: {{ .Values.port }} }
+          resources: {{ toYaml .Values.resources | nindent 12 }}
+      volumes:
+        - name: flags
+          configMap: { name: {{ .Release.Name }}-flags }

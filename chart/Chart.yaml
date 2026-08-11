@@ -1,0 +1,6 @@
+apiVersion: v2
+name: flag-file-relay
+description: Offline, file-backed LaunchDarkly-relay-compatible feature-flag server for air-gapped blue-stack installs.
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
