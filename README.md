@@ -27,6 +27,42 @@ Switching **online ⇄ offline** is only the value of `relayProxyUrl`:
 
 Nothing else changes.
 
+## Upstream mode: an in-cluster edge relay in front of flagtgl (or LaunchDarkly)
+
+Set `UPSTREAM_URI` and the same binary becomes a caching relay: it holds **one**
+upstream stream per SDK key for the whole cluster, keeps the last good flags on
+disk, and serves the LaunchDarkly server-side SDK endpoints to every process.
+
+```
+service pods ──(relayProxyUrl / LD_RELAY_URI)──▶ flag-relay ──▶ flagtgl.com
+ (LD SDK, unchanged)          in-cluster, 2 replicas, PVC      (or LaunchDarkly)
+```
+
+- **Protocol, both sides:** `GET /all`, `/flags` (legacy), `/sdk/latest-all`,
+  `/sdk/latest-flags[/key]`, `/sdk/latest-segments[/key]`, `POST /bulk`,
+  `/diagnostic`. Upstream it uses the same endpoints, so flagtgl or LaunchDarkly
+  (`UPSTREAM_STREAM_URI`, `UPSTREAM_POLL_URI`, `UPSTREAM_EVENTS_URI`) can sit there.
+- **Keys:** pass-through. The SDK's own key is forwarded upstream; only
+  `sha256(key)` is ever written to disk or logs. Optional `DENY_KEY_HASHES`,
+  `ALLOW_KEY_HASHES`.
+- **Outages:** every change is fsynced to `CACHE_DIR` before it is published, so
+  a relay restarted while upstream is down still serves. A reconciliation poll
+  (`RECONCILE_INTERVAL`, 60 s) catches anything a live stream missed.
+- **Replicas:** `PRIMARY_HOST`/`PRIMARY_URI` make one replica own the upstream
+  stream; the others follow it over the LD protocol and fall back to upstream
+  only while it is down. Replicas exchange snapshots on `PEER_PORT` (8081) and
+  a replica that restarted offline adopts the freshest confirmed copy.
+- **Restarts:** on SIGTERM `/readyz` turns 503 and SDK streams are closed
+  spread over `DRAIN_SPREAD` (20 s), so SDKs reconnect gradually.
+- **Events:** SDK analytics are batched per key and forwarded upstream
+  (de-duplicated by payload id).
+- **Ops:** `/healthz`, `/readyz`, `/status` (JSON), `/metrics` (Prometheus).
+- **Offline seeding:** `SDK_KEY=... CACHE_DIR=... flag-file-relay seed latest-all.json`.
+- **Start-up gate:** `flag-file-relay wait http://flag-relay:8080/readyz 120s`
+  (initContainer; always exits 0).
+
+Rollback for a service is its relay URL (back to `https://flagtgl.com`).
+
 ## Quick start (registry reachable)
 
 ```bash

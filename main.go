@@ -433,7 +433,39 @@ func main() {
 	var err error
 	switch args[0] {
 	case "serve":
-		err = serve()
+		if upstreamModeConfigured() {
+			err = serveUpstream()
+		} else {
+			err = serve()
+		}
+	case "seed":
+		// flag-file-relay seed <latest-all.json>  (env SDK_KEY, CACHE_DIR)
+		// Writes an upstream-mode cache entry so an appliance can start
+		// offline before it ever reached upstream.
+		if len(args) < 2 || os.Getenv("SDK_KEY") == "" || os.Getenv("CACHE_DIR") == "" {
+			err = fmt.Errorf("usage: SDK_KEY=... CACHE_DIR=... flag-file-relay seed <latest-all.json>")
+		} else {
+			var b []byte
+			if b, err = os.ReadFile(args[1]); err == nil {
+				err = seedCache(os.Getenv("CACHE_DIR"), os.Getenv("SDK_KEY"), b)
+			}
+		}
+	case "wait":
+		// flag-file-relay wait <url> [timeout]: start-up gate for flag
+		// consumers (initContainer). Polls <url> (the relay's /readyz) until
+		// it answers 200, or the timeout passes; never fails, so a missing
+		// relay delays a consumer but cannot block it.
+		if len(args) < 2 {
+			err = fmt.Errorf("usage: flag-file-relay wait <url> [timeout, default 120s]")
+		} else {
+			timeout := 120 * time.Second
+			if len(args) > 2 {
+				if d, perr := time.ParseDuration(args[2]); perr == nil {
+					timeout = d
+				}
+			}
+			waitReady(args[1], timeout)
+		}
 	case "list":
 		err = cliList(path)
 	case "get":
@@ -467,10 +499,29 @@ func main() {
 			err = cliSet(path, pos[0], pos[1], tenant, user)
 		}
 	default:
-		err = fmt.Errorf("unknown command %q (serve|list|get|set)", args[0])
+		err = fmt.Errorf("unknown command %q (serve|seed|wait|list|get|set)", args[0])
 	}
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)
+	}
+}
+
+func waitReady(url string, timeout time.Duration) {
+	client := &http.Client{Timeout: 2 * time.Second}
+	deadline := time.Now().Add(timeout)
+	for {
+		if resp, err := client.Get(url); err == nil {
+			resp.Body.Close()
+			if resp.StatusCode == http.StatusOK {
+				fmt.Printf("flag relay ready: %s\n", url)
+				return
+			}
+		}
+		if time.Now().After(deadline) {
+			fmt.Printf("flag relay not ready after %s (%s); starting anyway\n", timeout, url)
+			return
+		}
+		time.Sleep(time.Second)
 	}
 }

@@ -1,15 +1,17 @@
-# Lightweight, static, no-CGO — final image is ~15MB.
+# Static, no-CGO binary on an empty base: ~10 MB, no shell, runs as uid 1001.
 FROM golang:1.23-alpine AS build
+RUN apk add --no-cache ca-certificates
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o /flag-file-relay .
+ARG VERSION=dev
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" -o /flag-file-relay .
 
-FROM alpine:3.19
-RUN apk add --no-cache ca-certificates && adduser -u 1001 -D relay
+FROM scratch
+COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 COPY --from=build /flag-file-relay /usr/local/bin/flag-file-relay
-USER relay
+USER 1001:1001
 EXPOSE 8080
-ENTRYPOINT ["flag-file-relay"]
+ENTRYPOINT ["/usr/local/bin/flag-file-relay"]
 CMD ["serve"]
