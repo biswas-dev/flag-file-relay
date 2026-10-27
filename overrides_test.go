@@ -782,8 +782,8 @@ func TestReplicatedOverrideOlderThanLocalSourceDropped(t *testing.T) {
 	h := keyHash(testKey)
 	rev := uint64(time.Now().UnixMilli())
 	n.r.admin.adopt(overrideMap{
-		"a": {Value: json.RawMessage(`false`), Rev: rev, Origin: "peer", Upstream: map[string]uint64{h: 1}},                  // older than our v2
-		"b": {Value: json.RawMessage(`false`), Rev: rev, Origin: "peer", Upstream: map[string]uint64{h: 2}},                  // current
+		"a": {Value: json.RawMessage(`false`), Rev: rev, Origin: "peer", Upstream: map[string]uint64{h: 1}},                   // older than our v2
+		"b": {Value: json.RawMessage(`false`), Rev: rev, Origin: "peer", Upstream: map[string]uint64{h: 2}},                   // current
 		"c": {Value: json.RawMessage(`false`), Rev: rev, Origin: "peer", Upstream: map[string]uint64{h: 0}, LocalOnly: false}, // synthesized
 	})
 	if n.r.overrides.get("a").live() {
