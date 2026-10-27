@@ -33,6 +33,11 @@ func userAgent() string { return "FlagFileRelay/" + version }
 type relayConfig struct {
 	addr              string
 	peerAddr          string
+	adminAddr         string // admin API (local overrides); only with adminToken
+	adminToken        string
+	primaryAdmin      string // followers: the primary's admin API (writes are forwarded there)
+	overridesFile     string
+	overrideSync      time.Duration
 	streamURI         string
 	pollURI           string
 	eventsURI         string
@@ -67,6 +72,9 @@ func loadRelayConfig() (relayConfig, error) {
 	c := relayConfig{
 		addr:              ":" + envOr("PORT", "8080"),
 		peerAddr:          ":" + envOr("PEER_PORT", "8081"),
+		adminAddr:         ":" + envOr("ADMIN_PORT", "8082"),
+		adminToken:        adminToken(),
+		overrideSync:      envDur("OVERRIDE_SYNC_INTERVAL", 10*time.Second),
 		streamURI:         strings.TrimRight(envOr("UPSTREAM_STREAM_URI", base), "/"),
 		pollURI:           strings.TrimRight(envOr("UPSTREAM_POLL_URI", base), "/"),
 		eventsURI:         strings.TrimRight(envOr("UPSTREAM_EVENTS_URI", base), "/"),
@@ -119,6 +127,8 @@ func loadRelayConfig() (relayConfig, error) {
 			return c, fmt.Errorf("CACHE_DIR: %w", err)
 		}
 	}
+	c.overridesFile = overridesPath(c.cacheDir)
+	c.primaryAdmin = primaryAdminURI(c.primaryURI, strings.TrimPrefix(c.adminAddr, ":"))
 	return c, nil
 }
 
@@ -147,6 +157,8 @@ type relay struct {
 	httpClient   *http.Client
 	events       *eventForwarder
 	peers        *peerSet
+	overrides    *overrideStore
+	admin        *overrideAdmin
 
 	ctx         context.Context
 	mu          sync.Mutex
@@ -191,6 +203,8 @@ func newRelay(ctx context.Context, cfg relayConfig) *relay {
 		delete(r.disk, h)
 		removeCacheFile(cfg.cacheDir, h)
 	}
+	r.overrides = newOverrideStore(cfg.overridesFile, replicaName(), r.metrics)
+	r.admin = newOverrideAdmin(r.overrides, r, cfg.adminToken, r.peers, cfg.primaryAdmin, r.metrics)
 	r.events = newEventForwarder(r)
 	r.metrics.onScrape(r.scrapeGauges)
 	if n := len(r.disk); n > 0 {
@@ -244,7 +258,7 @@ func (r *relay) envFor(req *http.Request) (*env, *errStatus) {
 	}
 	r.mu.Unlock()
 
-	code, err := e.awaitData(req.Context())
+	code, err := e.awaitData(req.Context(), req.Header.Get(hdrPeer) != "")
 	if err != nil {
 		return nil, &errStatus{code, err.Error()}
 	}
@@ -409,8 +423,9 @@ func (r *relay) handlePoll(w http.ResponseWriter, req *http.Request) {
 		r.fail(w, ep, es)
 		return
 	}
-	ds, payload, etag, confirmed, upstream := e.snapshot()
-	if req.Header.Get(hdrPeer) != "" {
+	peer := req.Header.Get(hdrPeer) != ""
+	ds, payload, etag, confirmed, upstream := e.snapshot(peer)
+	if peer {
 		w.Header().Set(hdrConfirmedAt, fmt.Sprint(confirmed.UnixMilli()))
 		w.Header().Set(hdrUpstream, upstream)
 	}
@@ -608,6 +623,8 @@ func (r *relay) handleStatus(w http.ResponseWriter, _ *http.Request) {
 		"streams":        r.streams.Load(),
 		"cached_on_disk": cached,
 		"peers":          r.peers != nil,
+		"overrides":      countLive(r.overrides.snapshot()),
+		"admin":          r.admin.enabled(),
 		"environments":   r.statusList(),
 	})
 }
@@ -621,6 +638,7 @@ func (r *relay) scrapeGauges(m *metrics) {
 	}
 	st := r.statusList()
 	m.set("flagrelay_environments", float64(len(st)))
+	m.set("flagrelay_overrides", float64(countLive(r.overrides.snapshot())))
 	for _, s := range st {
 		m.set("flagrelay_data_age_seconds", s.DataAgeSeconds, "env", s.Env)
 		for _, src := range []string{"upstream", "disk", "peer"} {
@@ -656,6 +674,7 @@ func (r *relay) mux() *http.ServeMux {
 func (r *relay) peerMux() *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/relay/v1/snapshot/", r.handlePeerSnapshot)
+	mux.HandleFunc("/relay/v1/overrides", r.admin.handlePeer)
 	return mux
 }
 
@@ -687,7 +706,15 @@ func (r *relay) drain() {
 // start makes the relay ready: merge the disk cache with the peers first.
 func (r *relay) start(ctx context.Context) {
 	r.syncDiskWithPeers(ctx)
+	r.admin.startupSync(ctx, r.cfg.peerSyncWait)
+	// Overrides and cached data are written separately: after a crash between
+	// the two, an override may predate the cached source. Check before serving.
+	if dropped := r.reconcile(); len(dropped) > 0 {
+		r.applyOverrides(dropped)
+	}
 	go r.diskRetryLoop(ctx)
+	go r.overrides.retryLoop(ctx.Done(), r.cfg.persistRetry)
+	go r.admin.syncLoop(ctx, r.cfg.overrideSync)
 	r.ready.Store(true)
 }
 
@@ -705,10 +732,23 @@ func serveUpstream() error {
 	srv := &http.Server{Addr: cfg.addr, Handler: r.mux(), ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 120 * time.Second}
 	errc := make(chan error, 2)
 	go func() { errc <- srv.ListenAndServe() }()
-	var peerSrv *http.Server
-	if r.peers != nil {
+	var peerSrv, adminSrv *http.Server
+	// ADMIN_PORT may equal PEER_PORT: one listener then serves both.
+	shared := r.peers != nil && r.admin.enabled() && cfg.adminAddr == cfg.peerAddr
+	if r.peers != nil && !shared {
 		peerSrv = &http.Server{Addr: cfg.peerAddr, Handler: r.peerMux(), ReadHeaderTimeout: 5 * time.Second, WriteTimeout: 10 * time.Second}
 		go func() { errc <- peerSrv.ListenAndServe() }()
+	}
+	if r.admin.enabled() {
+		h := http.Handler(r.admin.mux())
+		if shared {
+			h = combinedMux(r.admin.mux(), r.peerMux())
+		}
+		adminSrv = &http.Server{Addr: cfg.adminAddr, Handler: h, ReadHeaderTimeout: 5 * time.Second, WriteTimeout: 15 * time.Second}
+		go func() { errc <- adminSrv.ListenAndServe() }()
+		log.Printf("admin API on %s", cfg.adminAddr)
+	} else {
+		log.Printf("admin API disabled (set RELAY_ADMIN_TOKEN to enable local overrides)")
 	}
 	log.Printf("flag-file-relay %s upstream mode on %s (stream %s, poll %s, events %s, cache %q, peers %q)",
 		version, cfg.addr, cfg.streamURI, cfg.pollURI, cfg.eventsURI, cfg.cacheDir, cfg.peerDNS)
@@ -732,6 +772,9 @@ func serveUpstream() error {
 	r.events.wg.Wait()
 	if peerSrv != nil {
 		_ = peerSrv.Shutdown(sctx)
+	}
+	if adminSrv != nil {
+		_ = adminSrv.Shutdown(sctx)
 	}
 	cancel()
 	log.Printf("stopped")
@@ -764,4 +807,107 @@ func (r *relay) fileLock(hash string) *sync.Mutex {
 		r.files[hash] = l
 	}
 	return l
+}
+
+// ── local overrides (overrideHost) ───────────────────────────────────────────
+
+func (r *relay) envList() []*env {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]*env, 0, len(r.envs))
+	for _, e := range r.envs {
+		out = append(out, e)
+	}
+	return out
+}
+
+// overridesChanged re-serves keys in every environment but except.
+func (r *relay) overridesChanged(keys []string, except *env) {
+	for _, e := range r.envList() {
+		if e != except {
+			e.overridesChanged(keys)
+		}
+	}
+}
+
+func (r *relay) applyOverrides(keys []string) { r.overridesChanged(keys, nil) }
+
+// sourceVersions: environments being relayed, plus those only on disk.
+func (r *relay) sourceVersions(key string) (map[string]uint64, map[string]bool) {
+	out, gone := map[string]uint64{}, map[string]bool{}
+	add := func(hash string, ds *dataSet) {
+		if ds == nil {
+			return
+		}
+		var v uint64
+		it, ok := ds.Flags[key]
+		if ok {
+			v = it.Version
+		}
+		out[hash] = v
+		if !ok || it.Deleted {
+			gone[hash] = true
+		}
+	}
+	for _, e := range r.envList() {
+		e.mu.Lock()
+		add(e.hash, e.data)
+		e.mu.Unlock()
+	}
+	r.mu.Lock()
+	for h, d := range r.disk {
+		if _, ok := out[h]; !ok && r.byHash[h] == nil {
+			add(h, d.data)
+		}
+	}
+	r.mu.Unlock()
+	return out, gone
+}
+
+func (r *relay) adminEnvs() []adminEnv {
+	var out []adminEnv
+	seen := map[string]bool{}
+	for _, e := range r.envList() {
+		e.mu.Lock()
+		out = append(out, adminEnv{hash: e.hash, raw: e.data, view: e.view})
+		e.mu.Unlock()
+		seen[e.hash] = true
+	}
+	ovs := r.overrides.snapshot()
+	r.mu.Lock()
+	for h, d := range r.disk {
+		if !seen[h] {
+			out = append(out, adminEnv{hash: h, raw: d.data, view: buildView(d.data, ovs, nil)})
+		}
+	}
+	r.mu.Unlock()
+	return out
+}
+
+// reconcile runs observe for every environment with data (an override merged
+// from a peer may be older than the source data held here).
+// Environments only on disk (no SDK has asked for them yet) are checked too:
+// they are served from that copy as soon as an SDK does.
+func (r *relay) reconcile() []string {
+	var dropped []string
+	seen := map[string]bool{}
+	for _, e := range r.envList() {
+		e.mu.Lock()
+		ds := e.data
+		e.mu.Unlock()
+		seen[e.hash] = true
+		dropped = append(dropped, r.overrides.observe(e.hash, ds, nil)...)
+	}
+	r.mu.Lock()
+	disk := map[string]*dataSet{}
+	for h, d := range r.disk {
+		if !seen[h] && r.byHash[h] == nil {
+			disk[h] = d.data
+		}
+	}
+	r.mu.Unlock()
+	for h, ds := range disk {
+		dropped = append(dropped, r.overrides.observe(h, ds, nil)...)
+	}
+	return dropped
 }

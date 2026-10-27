@@ -20,15 +20,21 @@
 //
 // Env (serve): PORT (8080), FLAGS_FILE (./flags.yaml), SDK_KEY (optional — if
 // set, requests must present it; if empty, any key is accepted).
+// Local overrides (both modes, see overrides.go / admin.go): RELAY_ADMIN_TOKEN
+// enables the admin API on ADMIN_PORT (8082); overrides are kept in
+// OVERRIDES_FILE (default $CACHE_DIR/overrides.json) and replicated to
+// PEER_DNS / PEER_ADDRS on PEER_PORT (8081).
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -160,15 +166,28 @@ func buildFlag(key string, spec FlagSpec) map[string]interface{} {
 // ── Server ──────────────────────────────────────────────────────────────────
 
 type server struct {
-	path   string
-	sdkKey string
+	path      string
+	sdkKey    string
+	overrides *overrideStore
+	admin     *overrideAdmin
 
-	mu       sync.RWMutex
-	snapshot []byte // marshalled {flags,segments}
-
-	subsMu sync.Mutex
-	subs   map[chan []byte]struct{}
+	mu      sync.Mutex
+	rawJSON []byte   // the file as an LD data set, to detect changes
+	raw     *dataSet // the file's flags
+	view    *dataSet // what SDKs are served: raw with the local overrides
+	payload []byte   // view as {flags, segments}
+	bump    map[string]uint64
+	subs    map[*fileSub]struct{}
 }
+
+type fileSub struct {
+	proto int
+	ch    chan []byte
+	kick  chan struct{}
+	once  sync.Once
+}
+
+func (f *fileSub) close() { f.once.Do(func() { close(f.kick) }) }
 
 func (s *server) rebuild() error {
 	ff, err := loadFlags(s.path)
@@ -180,30 +199,95 @@ func (s *server) rebuild() error {
 		return err
 	}
 	s.mu.Lock()
-	changed := string(s.snapshot) != string(b)
-	s.snapshot = b
+	same := string(s.rawJSON) == string(b)
 	s.mu.Unlock()
-	if changed {
-		s.broadcast(b)
+	if same {
+		return nil
 	}
+	ds, err := parseDataSet(b)
+	if err != nil {
+		return err
+	}
+	if len(ds.invalid) > 0 {
+		return fmt.Errorf("flags not servable: %v", ds.invalid)
+	}
+	// The file has no versions, so file changes never replace an override
+	// (unlike upstream mode): it stays until it is removed.
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.rawJSON, s.raw, s.bump = b, ds, nil
+	s.setViewLocked(buildView(ds, s.overrides.snapshot(), nil))
+	s.broadcastLocked(putMsgsFor(s.payload, s.view))
 	return nil
 }
 
-func (s *server) current() []byte {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.snapshot
+func (s *server) setViewLocked(v *dataSet) {
+	if v == nil {
+		v = newDataSet()
+	}
+	s.view = v
+	s.payload = v.marshal()
 }
 
-func (s *server) broadcast(b []byte) {
-	s.subsMu.Lock()
-	defer s.subsMu.Unlock()
-	for ch := range s.subs {
+func (s *server) current() []byte {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.payload
+}
+
+func (s *server) broadcastLocked(msgs [2][]byte) {
+	for sub := range s.subs {
+		msg := msgs[sub.proto]
+		if msg == nil {
+			continue
+		}
 		select {
-		case ch <- b:
+		case sub.ch <- msg:
 		default:
+			sub.close() // fell behind: it reconnects and gets a fresh put
 		}
 	}
+}
+
+// applyOverrides (overrideHost) re-serves keys: a patch or delete per flag
+// whose served form changed.
+func (s *server) applyOverrides(keys []string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.raw == nil {
+		return
+	}
+	old := s.view
+	ovs := s.overrides.snapshot()
+	all := overlayKeys(keys, ovs, s.bump)
+	v, bump := monotonic(old, s.raw, ovs, s.bump, all)
+	s.bump = bump
+	s.setViewLocked(v)
+	if msgs := diffMsgs(old, s.view, all, nil); msgs[0] != nil || msgs[1] != nil {
+		s.broadcastLocked(msgs)
+	}
+}
+
+// reconcile (overrideHost): file mode never drops an override for a file
+// change (the file has no versions).
+func (s *server) reconcile() []string { return nil }
+
+func (s *server) sourceVersions(key string) (map[string]uint64, map[string]bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var v uint64
+	if s.raw != nil {
+		if it, ok := s.raw.Flags[key]; ok {
+			v = it.Version
+		}
+	}
+	return map[string]uint64{"file": v}, map[string]bool{"file": v == 0}
+}
+
+func (s *server) adminEnvs() []adminEnv {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return []adminEnv{{hash: "file", raw: s.raw, view: s.view}}
 }
 
 func (s *server) authOK(r *http.Request) bool {
@@ -213,8 +297,10 @@ func (s *server) authOK(r *http.Request) bool {
 	return r.Header.Get("Authorization") == s.sdkKey
 }
 
-// GET /all — server-side streaming (SSE). Emits a "put" with the full data set,
-// then a fresh "put" whenever the file changes; keepalive comments in between.
+// GET /all ({flags, segments}) and GET /flags (legacy: flags only) —
+// server-side streaming (SSE). Emits a "put" with the full data set, then a
+// fresh "put" whenever the file changes and a "patch"/"delete" when a local
+// override changes; keepalive comments in between.
 func (s *server) handleAll(w http.ResponseWriter, r *http.Request) {
 	if !s.authOK(r) {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
@@ -225,21 +311,26 @@ func (s *server) handleAll(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
 		return
 	}
+	proto := protoAll
+	if r.URL.Path == "/flags" {
+		proto = protoFlags
+	}
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 
-	ch := make(chan []byte, 1)
-	s.subsMu.Lock()
-	s.subs[ch] = struct{}{}
-	s.subsMu.Unlock()
+	sub := &fileSub{proto: proto, ch: make(chan []byte, subscriberQueue), kick: make(chan struct{})}
+	s.mu.Lock()
+	s.subs[sub] = struct{}{}
+	put := putMsgsFor(s.payload, s.view)[proto]
+	s.mu.Unlock()
 	defer func() {
-		s.subsMu.Lock()
-		delete(s.subs, ch)
-		s.subsMu.Unlock()
+		s.mu.Lock()
+		delete(s.subs, sub)
+		s.mu.Unlock()
 	}()
 
-	writePut(w, s.current())
+	w.Write(put)
 	fl.Flush()
 
 	ka := time.NewTicker(25 * time.Second)
@@ -248,19 +339,16 @@ func (s *server) handleAll(w http.ResponseWriter, r *http.Request) {
 		select {
 		case <-r.Context().Done():
 			return
-		case b := <-ch:
-			writePut(w, b)
+		case <-sub.kick:
+			return
+		case b := <-sub.ch:
+			w.Write(b)
 			fl.Flush()
 		case <-ka.C:
 			fmt.Fprint(w, ":\n\n")
 			fl.Flush()
 		}
 	}
-}
-
-func writePut(w http.ResponseWriter, data []byte) {
-	// LD streaming "put": the SDK expects {"path":"/","data":{flags,segments}}.
-	fmt.Fprintf(w, "event: put\ndata: {\"path\":\"/\",\"data\":%s}\n\n", data)
 }
 
 // GET /sdk/latest-all — polling snapshot.
@@ -282,12 +370,41 @@ func (s *server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte("ok"))
 }
 
+func (s *server) mux() *http.ServeMux {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/all", s.handleAll)
+	mux.HandleFunc("/flags", s.handleAll)
+	mux.HandleFunc("/sdk/latest-all", s.handleLatestAll)
+	mux.HandleFunc("/sdk/poll", s.handleLatestAll)
+	mux.HandleFunc("/bulk", s.handleBulk)
+	mux.HandleFunc("/health", s.handleHealth)
+	return mux
+}
+
+func newFileServer(path, sdkKey, overridesFile, token string, peers *peerSet) *server {
+	m := newMetrics()
+	s := &server{path: path, sdkKey: sdkKey, subs: map[*fileSub]struct{}{}}
+	s.overrides = newOverrideStore(overridesFile, replicaName(), m)
+	s.admin = newOverrideAdmin(s.overrides, s, token, peers, "", m)
+	return s
+}
+
 func serve() error {
-	s := &server{
-		path:   envOr("FLAGS_FILE", "flags.yaml"),
-		sdkKey: os.Getenv("SDK_KEY"),
-		subs:   map[chan []byte]struct{}{},
+	cacheDir := os.Getenv("CACHE_DIR")
+	if cacheDir != "" {
+		if err := os.MkdirAll(cacheDir, 0o700); err != nil {
+			return fmt.Errorf("CACHE_DIR: %w", err)
+		}
 	}
+	peerPort := envOr("PEER_PORT", "8081")
+	var peerAddrs []string
+	for _, a := range strings.Split(os.Getenv("PEER_ADDRS"), ",") {
+		if a = strings.TrimSpace(a); a != "" {
+			peerAddrs = append(peerAddrs, a)
+		}
+	}
+	peers := newPeerSet(os.Getenv("PEER_DNS"), peerAddrs, peerPort, os.Getenv("POD_IP"))
+	s := newFileServer(envOr("FLAGS_FILE", "flags.yaml"), os.Getenv("SDK_KEY"), overridesPath(cacheDir), adminToken(), peers)
 	if err := s.rebuild(); err != nil {
 		return fmt.Errorf("loading %s: %w", s.path, err)
 	}
@@ -304,16 +421,33 @@ func serve() error {
 		}
 	}()
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("/all", s.handleAll)
-	mux.HandleFunc("/sdk/latest-all", s.handleLatestAll)
-	mux.HandleFunc("/sdk/poll", s.handleLatestAll)
-	mux.HandleFunc("/bulk", s.handleBulk)
-	mux.HandleFunc("/health", s.handleHealth)
-
+	errc := make(chan error, 3)
+	adminPort := envOr("ADMIN_PORT", "8082")
+	var adminHandler http.Handler
+	if s.admin.enabled() {
+		adminHandler = s.admin.mux()
+		if peers != nil {
+			pmux := http.NewServeMux()
+			pmux.HandleFunc("/relay/v1/overrides", s.admin.handlePeer)
+			if peerPort == adminPort { // one listener serves both
+				adminHandler = combinedMux(s.admin.mux(), pmux)
+			} else {
+				psrv := &http.Server{Addr: ":" + peerPort, Handler: pmux, ReadHeaderTimeout: 5 * time.Second, WriteTimeout: 10 * time.Second}
+				go func() { errc <- psrv.ListenAndServe() }()
+			}
+			s.admin.startupSync(context.Background(), envDur("PEER_SYNC_WAIT", 10*time.Second))
+			go s.admin.syncLoop(context.Background(), envDur("OVERRIDE_SYNC_INTERVAL", 10*time.Second))
+		}
+		go s.overrides.retryLoop(nil, 5*time.Second)
+		asrv := &http.Server{Addr: ":" + adminPort, Handler: adminHandler, ReadHeaderTimeout: 5 * time.Second, WriteTimeout: 15 * time.Second}
+		go func() { errc <- asrv.ListenAndServe() }()
+		fmt.Printf("admin API on %s\n", asrv.Addr)
+	}
 	addr := ":" + envOr("PORT", "8080")
-	fmt.Printf("flag-file-relay serving %s on %s (auth: %v)\n", s.path, addr, s.sdkKey != "")
-	return http.ListenAndServe(addr, mux)
+	srv := &http.Server{Addr: addr, Handler: s.mux(), ReadHeaderTimeout: 10 * time.Second}
+	go func() { errc <- srv.ListenAndServe() }()
+	fmt.Printf("flag-file-relay serving %s on %s (auth: %v, admin: %v)\n", s.path, addr, s.sdkKey != "", s.admin.enabled())
+	return <-errc
 }
 
 func envOr(k, d string) string {

@@ -57,11 +57,60 @@ service pods ──(relayProxyUrl / LD_RELAY_URI)──▶ flag-relay ──▶ 
 - **Events:** SDK analytics are batched per key and forwarded upstream
   (de-duplicated by payload id).
 - **Ops:** `/healthz`, `/readyz`, `/status` (JSON), `/metrics` (Prometheus).
+- **Local overrides:** see below (`RELAY_ADMIN_TOKEN`, `ADMIN_PORT`).
 - **Offline seeding:** `SDK_KEY=... CACHE_DIR=... flag-file-relay seed latest-all.json`.
 - **Start-up gate:** `flag-file-relay wait http://flag-relay:8080/readyz 120s`
   (initContainer; always exits 0).
 
 Rollback for a service is its relay URL (back to `https://flagtgl.com`).
+
+## Local overrides (admin API)
+
+Both modes can serve a local value on top of the source (upstream or the
+flags file): set `RELAY_ADMIN_TOKEN` (16+ characters) and an admin API listens
+on `ADMIN_PORT` (8082). Every request needs `Authorization: Bearer <token>`.
+Unset token = no admin API.
+
+```
+GET    /admin/flags[?env=<id>]      every flag: upstream value/version, override, effective value
+GET    /admin/flags/{key}           one flag (ETag = override revision)
+PUT    /admin/flags/{key}/override  {"value": <json>, "set_by": "who", "local_only": false}
+DELETE /admin/flags/{key}/override[?set_by=who]
+```
+
+- **Served everywhere:** the stream (`/all`, `/flags`: a `patch`/`delete` per
+  change), `/sdk/latest-all`, `/sdk/latest-flags[/key]`. Boolean, string,
+  number and JSON values; the flag is served with that single value to every
+  context. A flag the source does not define is synthesized. Overrides apply
+  to every SDK key the relay serves. Peers always get the source data.
+- **Last write wins:** an override remembers the flag's source version; a
+  later source change (higher version) replaces it, logged once.
+  `"local_only": true` overrides are never replaced by the source. In file
+  mode the file has no versions, so an override stays until it is removed.
+- **Concurrency:** `If-Match: "<etag>"` on PUT/DELETE (the `ETag` header or
+  `override.etag`; `"0"` = no override yet, `"*"` = one exists) answers 412
+  when the override changed since it was read.
+- **Durable:** kept in `OVERRIDES_FILE` (default `$CACHE_DIR/overrides.json`),
+  written with fsync before it is served; an admin write that cannot be
+  persisted is refused (503). Without either, overrides live in memory only.
+- **Replicated:** followers forward writes to the primary's admin port
+  (`PRIMARY_ADMIN_URI`, default: `PRIMARY_URI`'s host on `ADMIN_PORT`) and
+  apply them locally only while it is down. Each write is pushed to every peer
+  (`PEER_DNS`/`PEER_ADDRS`, `PEER_PORT`, same token) before the answer, and
+  replicas pull each other every `OVERRIDE_SYNC_INTERVAL` (10 s) and before
+  they report ready. Records merge per key by (revision, replica).
+- **Air-gapped:** an upstream-mode relay that never reached upstream and has
+  no cached data still serves its overrides (and nothing else) to SDKs.
+- **Chart:** `--set admin.enabled=true --set admin.existingSecret=<secret>`
+  (key `token`) exposes the admin port on the Service and adds the headless
+  `<release>-peer` Service for replication.
+
+Example:
+```bash
+curl -s -X PUT -H "Authorization: Bearer $RELAY_ADMIN_TOKEN" \
+  -d '{"value": false, "set_by": "me@example.com"}' \
+  http://flag-file-relay:8082/admin/flags/new-rbac/override
+```
 
 ## Quick start (registry reachable)
 
