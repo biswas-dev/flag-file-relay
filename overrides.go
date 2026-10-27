@@ -332,11 +332,16 @@ func matches(cur *overrideRecord, ifMatch string) bool {
 	if ifMatch == "*" {
 		return cur.live()
 	}
-	var rev uint64
-	if cur.live() {
-		rev = cur.Rev
+	return ifMatch == cur.etag()
+}
+
+// etag is the concurrency token of the current override: revision and
+// replica (two replicas can issue the same revision), "0" for none.
+func (o *overrideRecord) etag() string {
+	if !o.live() {
+		return "0"
 	}
-	return ifMatch == fmt.Sprint(rev)
+	return fmt.Sprintf("%d-%s", o.Rev, o.Origin)
 }
 
 // set creates or replaces the override of key. base returns the source flag

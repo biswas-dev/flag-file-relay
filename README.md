@@ -87,8 +87,9 @@ DELETE /admin/flags/{key}/override[?set_by=who]
   later source change (higher version) replaces it, logged once.
   `"local_only": true` overrides are never replaced by the source. In file
   mode the file has no versions, so an override stays until it is removed.
-- **Concurrency:** `If-Match: "<rev>"` on PUT/DELETE (`"0"` = no override yet,
-  `"*"` = one exists) answers 412 when the override changed since it was read.
+- **Concurrency:** `If-Match: "<etag>"` on PUT/DELETE (the `ETag` header or
+  `override.etag`; `"0"` = no override yet, `"*"` = one exists) answers 412
+  when the override changed since it was read.
 - **Durable:** kept in `OVERRIDES_FILE` (default `$CACHE_DIR/overrides.json`),
   written with fsync before it is served; an admin write that cannot be
   persisted is refused (503). Without either, overrides live in memory only.

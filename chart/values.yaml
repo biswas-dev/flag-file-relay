@@ -32,8 +32,10 @@ admin:
 peerPort: 8081
 # Where overrides are kept (fsynced). By default an emptyDir: overrides then
 # survive a pod restart through the other replica, but not every replica
-# restarting at once. Set existingClaim (ReadWriteMany, or replicas: 1) to
-# keep them on a volume.
+# restarting at once. Set existingClaim (with replicas: 1; replicas must not
+# share one overrides file) to keep them on a volume. For several replicas
+# with durable overrides, run upstream mode as a StatefulSet with one PVC
+# per pod.
 persistence:
   mountPath: /var/lib/flag-relay
   existingClaim: ""

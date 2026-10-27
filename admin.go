@@ -11,9 +11,9 @@ package main
 //	PUT    /admin/flags/{key}/override   {"value": <json>, "set_by": "...", "local_only": bool}
 //	DELETE /admin/flags/{key}/override
 //
-// PUT and DELETE accept If-Match: "<rev>" (the override.rev last read; "0" =
-// there was no override, "*" = there is one) and answer 412 when the override
-// changed since, so a read-modify-write client can retry.
+// PUT and DELETE accept If-Match: "<etag>" (the ETag header, or override.etag,
+// last read; "0" = there was no override, "*" = there is one) and answer 412
+// when the override changed since, so a read-modify-write client can retry.
 //
 // Replication. On a follower (PRIMARY_URI set) writes are forwarded to the
 // primary's admin port while it answers, so the replicas order every write
@@ -168,6 +168,7 @@ type overrideInfo struct {
 	LocalOnly       bool            `json:"local_only"`
 	Rev             uint64          `json:"rev"`
 	Origin          string          `json:"origin"`
+	ETag            string          `json:"etag"`             // If-Match token for PUT/DELETE
 	UpstreamVersion *uint64         `json:"upstream_version"` // source version when set, in this environment
 }
 
@@ -223,7 +224,7 @@ func (a *overrideAdmin) entry(env *adminEnv, key string, rec *overrideRecord) fl
 		}
 	}
 	if rec.live() {
-		oi := &overrideInfo{Value: rec.Value, SetBy: rec.SetBy, SetAt: rec.SetAt, LocalOnly: rec.LocalOnly, Rev: rec.Rev, Origin: rec.Origin}
+		oi := &overrideInfo{Value: rec.Value, SetBy: rec.SetBy, SetAt: rec.SetAt, LocalOnly: rec.LocalOnly, Rev: rec.Rev, Origin: rec.Origin, ETag: rec.etag()}
 		if env != nil {
 			if v, ok := rec.Upstream[env.hash]; ok {
 				oi.UpstreamVersion = &v
@@ -333,7 +334,7 @@ func revETag(fe flagEntry) string {
 	if fe.Override == nil {
 		return `"0"`
 	}
-	return fmt.Sprintf(`"%d"`, fe.Override.Rev)
+	return `"` + fe.Override.ETag + `"`
 }
 
 func (a *overrideAdmin) handleGet(w http.ResponseWriter, req *http.Request) {

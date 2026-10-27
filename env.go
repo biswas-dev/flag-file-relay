@@ -142,7 +142,11 @@ func (e *env) setDataLocked(ds *dataSet, source string) {
 // next, so the version offsets start over; otherwise keys are the flags that
 // may have changed, and each is kept at a higher version than the SDKs hold.
 func (e *env) rebuildViewLocked(keys []string, full bool) {
-	ovs := e.r.overrides.snapshot()
+	e.rebuildViewWith(e.r.overrides.snapshot(), keys, full)
+}
+
+// rebuildViewWith is rebuildViewLocked for a given override snapshot.
+func (e *env) rebuildViewWith(ovs overrideMap, keys []string, full bool) {
 	if full {
 		e.bump = nil
 		e.view = buildView(e.data, ovs, nil)
@@ -181,8 +185,9 @@ func (e *env) overridesChanged(keys []string) {
 // nothing left to announce.
 func (e *env) refreshViewLocked(must []string) [2][]byte {
 	old := e.view
-	keys := overlayKeys(must, e.r.overrides.snapshot(), e.bump)
-	e.rebuildViewLocked(keys, false)
+	ovs := e.r.overrides.snapshot() // one snapshot for key selection and rebuild
+	keys := overlayKeys(must, ovs, e.bump)
+	e.rebuildViewWith(ovs, keys, false)
 	return diffMsgs(old, e.view, keys, must)
 }
 

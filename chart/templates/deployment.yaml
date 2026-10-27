@@ -1,3 +1,6 @@
+{{- if and .Values.admin.enabled .Values.persistence.existingClaim (gt (int .Values.replicas) 1) }}
+{{- fail "persistence.existingClaim needs replicas: 1 (replicas must not share one overrides file)" }}
+{{- end }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
