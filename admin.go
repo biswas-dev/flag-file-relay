@@ -65,7 +65,7 @@ type overrideHost interface {
 	adminEnvs() []adminEnv
 	// sourceVersions returns, per environment with data, the version of the
 	// source flag key (0 when it has none).
-	sourceVersions(key string) map[string]uint64
+	sourceVersions(key string) (map[string]uint64, map[string]bool)
 	// applyOverrides re-serves keys after an override change.
 	applyOverrides(keys []string)
 	// reconcile checks the overrides against the source data held now
@@ -398,7 +398,7 @@ func (a *overrideAdmin) handlePut(w http.ResponseWriter, req *http.Request) {
 	if a.forward(w, req, b) {
 		return
 	}
-	_, err = a.store.set(key, body.Value, body.SetBy, body.LocalOnly, ifMatch(req), func() map[string]uint64 { return a.host.sourceVersions(key) })
+	_, err = a.store.set(key, body.Value, body.SetBy, body.LocalOnly, ifMatch(req), func() (map[string]uint64, map[string]bool) { return a.host.sourceVersions(key) })
 	a.afterWrite(w, req, key, err)
 }
 

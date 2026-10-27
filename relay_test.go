@@ -824,6 +824,9 @@ func TestEventDedupeAcrossReplicas(t *testing.T) {
 // out), and the failure is visible.
 func TestPersistFailureStillPublishesAndReports(t *testing.T) {
 	dir := t.TempDir()
+	// Runs after the relay has stopped (cleanups are LIFO), so a background
+	// retry cannot write into the directory while it is being removed.
+	t.Cleanup(func() { time.Sleep(50 * time.Millisecond); os.Chmod(dir, 0o700) })
 	up := newMockUpstream(t, dataJSON(flagJSON("a", 1, true)))
 	r, srv, _ := startRelay(t, testConfig(up.srv.URL, dir))
 	s := openStream(t, srv.URL, testKey)
@@ -831,7 +834,6 @@ func TestPersistFailureStillPublishesAndReports(t *testing.T) {
 	if err := os.Chmod(dir, 0o500); err != nil {
 		t.Fatal(err)
 	}
-	defer os.Chmod(dir, 0o700)
 	up.send("event: patch\ndata: {\"path\":\"/flags/a\",\"data\":" + flagJSON("a", 2, false) + "}\n\n")
 	if ev := s.next(t); ev.Name != "patch" {
 		t.Fatalf("got %+v", ev)

@@ -272,7 +272,7 @@ func (s *server) applyOverrides(keys []string) {
 // change (the file has no versions).
 func (s *server) reconcile() []string { return nil }
 
-func (s *server) sourceVersions(key string) map[string]uint64 {
+func (s *server) sourceVersions(key string) (map[string]uint64, map[string]bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var v uint64
@@ -281,7 +281,7 @@ func (s *server) sourceVersions(key string) map[string]uint64 {
 			v = it.Version
 		}
 	}
-	return map[string]uint64{"file": v}
+	return map[string]uint64{"file": v}, map[string]bool{"file": v == 0}
 }
 
 func (s *server) adminEnvs() []adminEnv {

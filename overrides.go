@@ -84,6 +84,10 @@ type overrideRecord struct {
 	// Upstream holds, per environment (sha256 of the SDK key, or "file"), the
 	// version of the source flag when the override was set (0: no such flag).
 	Upstream map[string]uint64 `json:"upstream_versions,omitempty"`
+	// Gone marks environments where the source had no live flag (absent, or
+	// deleted at that version) when the override was set: a full snapshot
+	// that removes a flag keeps its version, so liveness is compared too.
+	Gone map[string]bool `json:"upstream_absent,omitempty"`
 }
 
 func (o *overrideRecord) live() bool { return o != nil && !o.Deleted }
@@ -105,6 +109,12 @@ func (o *overrideRecord) clone() *overrideRecord {
 		c.Upstream = make(map[string]uint64, len(o.Upstream))
 		for k, v := range o.Upstream {
 			c.Upstream[k] = v
+		}
+	}
+	if o.Gone != nil {
+		c.Gone = make(map[string]bool, len(o.Gone))
+		for k, v := range o.Gone {
+			c.Gone[k] = v
 		}
 	}
 	return &c
@@ -381,7 +391,7 @@ func (o *overrideRecord) etag() string {
 // version per environment; it runs under mu, and every commit of source data
 // observes and publishes under mu too (observe), so the versions it reads are
 // exactly the data served when the override takes effect.
-func (s *overrideStore) set(key string, value json.RawMessage, setBy string, localOnly bool, ifMatch string, base func() map[string]uint64) (*overrideRecord, error) {
+func (s *overrideStore) set(key string, value json.RawMessage, setBy string, localOnly bool, ifMatch string, base func() (map[string]uint64, map[string]bool)) (*overrideRecord, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	cur := s.snapshot()
@@ -408,7 +418,7 @@ func (s *overrideStore) set(key string, value json.RawMessage, setBy string, loc
 		LocalOnly: localOnly, Rev: s.tick(), Origin: s.origin,
 	}
 	if base != nil {
-		rec.Upstream = base()
+		rec.Upstream, rec.Gone = base()
 	}
 	next := copyMap(cur)
 	next[key] = rec
@@ -491,6 +501,12 @@ func (s *overrideStore) merge(in overrideMap) []string {
 				}
 				for env, v := range add {
 					c.Upstream[env] = v
+					if o.Gone[env] {
+						if c.Gone == nil {
+							c.Gone = map[string]bool{}
+						}
+						c.Gone[env] = true
+					}
 				}
 				next[k] = c
 				dirty = true
@@ -539,21 +555,24 @@ func (s *overrideStore) observeLocked(envID string, ds *dataSet) []string {
 			continue
 		}
 		var v uint64
+		live := false
 		if it, ok := ds.Flags[k]; ok {
-			v = it.Version
+			v, live = it.Version, !it.Deleted
 		}
 		base, known := o.Upstream[envID]
+		baseLive := !o.Gone[envID] && base > 0
+		removed := known && v == base && baseLive && !live // deleted by a full snapshot, same version
 		switch {
-		case known && v == base:
+		case known && v == base && !removed:
 			continue
-		case known && v > base && !o.LocalOnly:
+		case (known && v > base || removed) && !o.LocalOnly:
 			if next == nil {
 				next = copyMap(cur)
 			}
 			next[k] = &overrideRecord{SetAt: time.Now().UTC(), Deleted: true, Reason: "upstream", Rev: s.tick(), Origin: s.origin}
 			dropped = append(dropped, k)
 			log.Printf("override dropped: %s changed at the source (version %d, override set against %d); serving the source value", k, v, base)
-		case !known || v > base:
+		case !known || v > base || removed:
 			// First sight of this environment, or a local_only override: re-base.
 			if next == nil {
 				next = copyMap(cur)
@@ -563,6 +582,14 @@ func (s *overrideStore) observeLocked(envID string, ds *dataSet) []string {
 				c.Upstream = map[string]uint64{}
 			}
 			c.Upstream[envID] = v
+			if !live {
+				if c.Gone == nil {
+					c.Gone = map[string]bool{}
+				}
+				c.Gone[envID] = true
+			} else if c.Gone != nil {
+				delete(c.Gone, envID)
+			}
 			next[k] = c
 		}
 	}

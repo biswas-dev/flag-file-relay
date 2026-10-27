@@ -833,17 +833,21 @@ func (r *relay) overridesChanged(keys []string, except *env) {
 func (r *relay) applyOverrides(keys []string) { r.overridesChanged(keys, nil) }
 
 // sourceVersions: environments being relayed, plus those only on disk.
-func (r *relay) sourceVersions(key string) map[string]uint64 {
-	out := map[string]uint64{}
+func (r *relay) sourceVersions(key string) (map[string]uint64, map[string]bool) {
+	out, gone := map[string]uint64{}, map[string]bool{}
 	add := func(hash string, ds *dataSet) {
 		if ds == nil {
 			return
 		}
 		var v uint64
-		if it, ok := ds.Flags[key]; ok {
+		it, ok := ds.Flags[key]
+		if ok {
 			v = it.Version
 		}
 		out[hash] = v
+		if !ok || it.Deleted {
+			gone[hash] = true
+		}
 	}
 	for _, e := range r.envList() {
 		e.mu.Lock()
@@ -857,7 +861,7 @@ func (r *relay) sourceVersions(key string) map[string]uint64 {
 		}
 	}
 	r.mu.Unlock()
-	return out
+	return out, gone
 }
 
 func (r *relay) adminEnvs() []adminEnv {

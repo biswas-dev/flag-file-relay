@@ -756,8 +756,8 @@ func TestConcurrentOverrideChangesAllAnnounced(t *testing.T) {
 	s := openStream(t, n.sdk.URL, testKey)
 	s.next(t)
 	// Both stored before any env is notified; only a's notification runs first.
-	n.r.overrides.set("a", json.RawMessage(`false`), "", false, "", func() map[string]uint64 { return n.r.sourceVersions("a") })
-	n.r.overrides.set("b", json.RawMessage(`false`), "", false, "", func() map[string]uint64 { return n.r.sourceVersions("b") })
+	n.r.overrides.set("a", json.RawMessage(`false`), "", false, "", func() (map[string]uint64, map[string]bool) { return n.r.sourceVersions("a") })
+	n.r.overrides.set("b", json.RawMessage(`false`), "", false, "", func() (map[string]uint64, map[string]bool) { return n.r.sourceVersions("b") })
 	n.r.applyOverrides([]string{"a"})
 	n.r.applyOverrides([]string{"b"})
 	got := map[string]bool{}
@@ -842,7 +842,7 @@ func TestFileModeOverrideSurvivesAddingTheFlag(t *testing.T) {
 	if err := s.rebuild(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.overrides.set("y", json.RawMessage(`"local"`), "", false, "", func() map[string]uint64 { return s.sourceVersions("y") }); err != nil {
+	if _, err := s.overrides.set("y", json.RawMessage(`"local"`), "", false, "", func() (map[string]uint64, map[string]bool) { return s.sourceVersions("y") }); err != nil {
 		t.Fatal(err)
 	}
 	s.applyOverrides([]string{"y"})
@@ -893,7 +893,7 @@ func TestStartupReconcilesOverridesWithCache(t *testing.T) {
 		t.Fatal(err)
 	}
 	st := newOverrideStore(filepath.Join(dir, "overrides.json"), "old", newMetrics())
-	if _, err := st.set("a", json.RawMessage(`false`), "", false, "", func() map[string]uint64 { return map[string]uint64{keyHash(testKey): 1} }); err != nil {
+	if _, err := st.set("a", json.RawMessage(`false`), "", false, "", func() (map[string]uint64, map[string]bool) { return map[string]uint64{keyHash(testKey): 1}, nil }); err != nil {
 		t.Fatal(err)
 	}
 	up := newMockUpstream(t, dataJSON(flagJSON("a", 2, true)))
@@ -977,5 +977,26 @@ func TestOverrideKeepsVariationIndices(t *testing.T) {
 	ok := strings.Repeat("[", 100) + strings.Repeat("]", 100)
 	if err := validOverrideValue(json.RawMessage(ok)); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// Codex r8: a full snapshot that removes an overridden flag (tombstone at the
+// same version) is a source change: a non local_only override is dropped.
+func TestFullSnapshotDeletionDropsOverride(t *testing.T) {
+	up := newMockUpstream(t, dataJSON(flagJSON("a", 3, true), flagJSON("b", 3, true)))
+	n := startNode(t, testConfig(up.srv.URL, t.TempDir()), nil, nil)
+	s := openStream(t, n.sdk.URL, testKey)
+	s.next(t)
+	putOverride(t, n.admin.URL, "a", `{"value":false}`)
+	putOverride(t, n.admin.URL, "b", `{"value":false,"local_only":true}`)
+	s.next(t)
+	s.next(t)
+	up.send("event: put\ndata: {\"path\":\"/\",\"data\":" + dataJSON() + "}\n\n")
+	waitFor(t, "a dropped", func() bool { return !n.r.overrides.get("a").live() })
+	if v := valueOf(t, n.sdk.URL, "a"); v != "<absent>" {
+		t.Fatalf("a = %s, want deleted", v)
+	}
+	if !n.r.overrides.get("b").live() || valueOf(t, n.sdk.URL, "b") != "false" {
+		t.Fatal("local_only override must survive the deletion")
 	}
 }
