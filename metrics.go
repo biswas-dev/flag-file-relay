@@ -40,6 +40,11 @@ func newMetrics() *metrics {
 		"flagrelay_startup_peer_sync_total":       {"counter", "Start-up peer sync outcomes"},
 		"flagrelay_cache_write_errors_total":      {"counter", "Failed writes of the on-disk cache"},
 		"flagrelay_draining":                      {"gauge", "1 while the relay is shutting down"},
+		"flagrelay_overrides":                     {"gauge", "Local overrides in force"},
+		"flagrelay_override_changes_total":        {"counter", "Override changes by source (admin, peer, upstream)"},
+		"flagrelay_override_write_errors_total":   {"counter", "Failed writes of the overrides file"},
+		"flagrelay_override_startup_sync_total":   {"counter", "Start-up override sync outcomes"},
+		"flagrelay_admin_requests_total":          {"counter", "Admin API requests by status code"},
 	} {
 		m.kinds[name], m.help[name] = h[0], h[1]
 	}

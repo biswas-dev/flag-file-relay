@@ -1,6 +1,6 @@
 image:
   repository: docker.io/anchoo2kewl/flag-file-relay
-  tag: v0.1.0
+  tag: v0.3.0
   pullPolicy: IfNotPresent
 replicas: 2
 port: 8080
@@ -15,6 +15,29 @@ flags:
     value: false
   notification-rules:
     value: false
+
+# Local overrides: an admin API (separate port, bearer token) that sets a flag
+# to a value on the relay, on top of the flags above. Off unless enabled.
+admin:
+  enabled: false
+  port: 8082
+  # Secret holding the bearer token (at least 16 characters). Use an existing
+  # Secret (also mounted by whatever calls the admin API), or set `token` and
+  # the chart creates `<release>-admin`.
+  existingSecret: ""
+  secretKey: token
+  token: ""
+# Replicas exchange overrides on this port (headless Service <release>-peer),
+# authenticated with the admin token.
+peerPort: 8081
+# Where overrides are kept (fsynced). By default an emptyDir: overrides then
+# survive a pod restart through the other replica, but not every replica
+# restarting at once. Set existingClaim (ReadWriteMany, or replicas: 1) to
+# keep them on a volume.
+persistence:
+  mountPath: /var/lib/flag-relay
+  existingClaim: ""
+
 resources:
   requests: { cpu: 10m, memory: 16Mi }
   limits: { cpu: 100m, memory: 64Mi }

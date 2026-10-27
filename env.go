@@ -80,11 +80,15 @@ type env struct {
 	data        *dataSet
 	payload     []byte // live items as {flags, segments}
 	etag        string
-	source      string // "upstream" | "primary" | "disk" | "peer"
-	gen         uint64 // bumped on every published change
-	extEpoch    uint64 // bumped by every change published by a poll or a peer copy
-	authority   bool   // direct stream open AND its initial put committed
-	chainOK     bool   // the upstream chain is healthy: authority, or a primary that is itself authoritative
+	view        *dataSet          // what SDKs are served: data with the local overrides (== data when none)
+	viewPayload []byte            // view as {flags, segments}
+	viewEtag    string            //
+	bump        map[string]uint64 // per-flag version offsets keeping served versions increasing (overrides.go)
+	source      string            // "upstream" | "primary" | "disk" | "peer"
+	gen         uint64            // bumped on every published change
+	extEpoch    uint64            // bumped by every change published by a poll or a peer copy
+	authority   bool              // direct stream open AND its initial put committed
+	chainOK     bool              // the upstream chain is healthy: authority, or a primary that is itself authoritative
 	confirmedAt time.Time
 	savedAt     time.Time
 	persistErr  string
@@ -117,6 +121,7 @@ func newEnv(r *relay, key, hash string, disk *diskEntry) *env {
 			e.persistErr = "start-up peer copy not yet written" // persistRetryLoop writes it
 		}
 	}
+	e.rebuildViewLocked(nil, true)
 	return e
 }
 
@@ -130,6 +135,57 @@ func (e *env) setDataLocked(ds *dataSet, source string) {
 	e.payload = ds.marshal()
 	e.etag = etagOf(e.payload)
 	e.source = source
+}
+
+// rebuildViewLocked recomputes the view served to SDKs from the data and the
+// current overrides. full: a put of the whole view goes to every SDK stream
+// next, so the version offsets start over; otherwise keys are the flags that
+// may have changed, and each is kept at a higher version than the SDKs hold.
+func (e *env) rebuildViewLocked(keys []string, full bool) {
+	ovs := e.r.overrides.snapshot()
+	if full {
+		e.bump = nil
+		e.view = buildView(e.data, ovs, nil)
+	} else {
+		e.view, e.bump = monotonic(e.view, e.data, ovs, e.bump, keys)
+	}
+	switch {
+	case e.view == e.data:
+		e.viewPayload, e.viewEtag = e.payload, e.etag
+	case e.view == nil:
+		e.viewPayload, e.viewEtag = nil, ""
+	default:
+		e.viewPayload = e.view.marshal()
+		e.viewEtag = etagOf(e.viewPayload)
+	}
+}
+
+// overridesChanged re-serves keys after an override change: SDK streams get a
+// patch (or delete) per flag whose served form changed; peers see nothing
+// (they only ever get the source data).
+func (e *env) overridesChanged(keys []string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	old := e.view
+	e.rebuildViewLocked(keys, false)
+	if old != nil {
+		var parts [][2][]byte
+		for _, k := range keys {
+			o, oOK := old.Flags[k]
+			var n item
+			var nOK bool
+			if e.view != nil {
+				n, nOK = e.view.Flags[k]
+			}
+			if !sameItem(o, oOK, n, nOK) {
+				parts = append(parts, itemMsgs(e.view, k))
+			}
+		}
+		if len(parts) > 0 {
+			e.broadcastLocked([2][]byte{}, concatMsgs(parts...))
+		}
+	}
+	e.notifyLocked() // an env without data may now be servable (override only)
 }
 
 func (e *env) isFollower() bool { return e.r.cfg.primaryURI != "" }
@@ -151,11 +207,20 @@ func (e *env) start(ctx context.Context) {
 
 // ── commit pipeline ─────────────────────────────────────────────────────────
 
+// dsChange says which downstream event a commit sends: a full put, one item
+// (patch, or delete when it is a tombstone), or nothing (zero value).
+type dsChange struct {
+	put       bool
+	kind, key string
+	it        item
+}
+
 // commit publishes next as the env's data: disk first (retried), then memory
-// and subscribers. Caller holds commitMu. msgs builds the downstream events
-// from the published state (nil = no downstream message). fences marks a
-// change (poll or peer copy) that a stream's initial put must not undo.
-func (e *env) commit(next *dataSet, source string, confirmed time.Time, fences bool, msgs func() [2][]byte) {
+// and subscribers. Caller holds commitMu. ch says which event goes
+// downstream. fences marks a change (poll or peer copy) that a stream's
+// initial put must not undo.
+func (e *env) commit(next *dataSet, source string, confirmed time.Time, fences bool, ch dsChange) {
+	started := time.Now()
 	// The confirmation stored on disk and the one published are the same:
 	// never older than what memory already holds (keepalives also take
 	// commitMu, so nothing can move it while this commit runs).
@@ -186,18 +251,70 @@ func (e *env) commit(next *dataSet, source string, confirmed time.Time, fences b
 		}
 		e.mu.Unlock()
 	}
+	// Overrides whose flag the source has changed since are dropped (last
+	// write wins), before the change is served.
+	dropped := e.r.overrides.observe(e.hash, next, started)
 	e.mu.Lock()
-	defer e.mu.Unlock()
 	e.gen++
 	if fences {
 		e.extEpoch++
 	}
 	e.setDataLocked(next, source)
 	e.confirmedAt = confirmed
-	if msgs != nil {
-		e.broadcastLocked(msgs())
+	var raw, sdk [2][]byte
+	switch {
+	case ch.put:
+		raw = e.putMsgs()
+		e.rebuildViewLocked(nil, true)
+		sdk = raw
+		if e.view != e.data {
+			sdk = putMsgsFor(e.viewPayload, e.view)
+		}
+	case ch.key != "":
+		if ch.it.Deleted {
+			raw = deleteMsgs(ch.kind, ch.key, ch.it.Version)
+		} else {
+			raw = patchMsgs(ch.kind, ch.key, ch.it.Raw)
+		}
+		keys := dropped
+		if ch.kind == "flags" {
+			keys = []string{ch.key}
+			for _, k := range dropped {
+				if k != ch.key {
+					keys = append(keys, k)
+				}
+			}
+		}
+		e.rebuildViewLocked(keys, false)
+		sdk = raw
+		if e.view != e.data || len(dropped) > 0 {
+			var parts [][2][]byte
+			if ch.kind != "flags" {
+				parts = append(parts, raw)
+			}
+			for _, k := range keys {
+				parts = append(parts, itemMsgs(e.view, k))
+			}
+			sdk = concatMsgs(parts...)
+		}
+	default:
+		if len(dropped) > 0 {
+			e.rebuildViewLocked(dropped, false)
+			var parts [][2][]byte
+			for _, k := range dropped {
+				parts = append(parts, itemMsgs(e.view, k))
+			}
+			sdk = concatMsgs(parts...)
+		} else {
+			e.rebuildViewLocked(nil, false)
+		}
 	}
+	e.broadcastLocked(raw, sdk)
 	e.notifyLocked()
+	e.mu.Unlock()
+	if len(dropped) > 0 {
+		e.r.overridesChanged(dropped, e) // every other environment serves the source again too
+	}
 }
 
 // persistRetryLoop rewrites the current data while the last write failed.
@@ -654,12 +771,7 @@ func (e *env) applyPutChecked(ds *dataSet, src string, confirmed time.Time, from
 		e.mu.Unlock()
 		return false, putApplied
 	}
-	e.commit(next, src, confirmed, fromPoll, func() [2][]byte {
-		if changed {
-			return e.putMsgs()
-		}
-		return [2][]byte{}
-	})
+	e.commit(next, src, confirmed, fromPoll, dsChange{put: changed})
 	return changed, putApplied
 }
 
@@ -688,12 +800,7 @@ func (e *env) applyUpsert(kind, key string, it item, src string, confirmed time.
 		e.touchLocked(confirmed)
 		return true // not newer than what we hold
 	}
-	e.commit(next, src, confirmed, false, func() [2][]byte {
-		if it.Deleted {
-			return deleteMsgs(kind, key, it.Version)
-		}
-		return patchMsgs(kind, key, it.Raw)
-	})
+	e.commit(next, src, confirmed, false, dsChange{kind: kind, key: key, it: it})
 	return true
 }
 
@@ -713,12 +820,7 @@ func (e *env) applyPeerSnapshot(ds *dataSet, confirmed time.Time) {
 		next = cur.replaceFrom(ds)
 	}
 	changed := cur == nil || !cur.equal(next)
-	e.commit(next, "peer", confirmed, true, func() [2][]byte {
-		if changed {
-			return e.putMsgs()
-		}
-		return [2][]byte{}
-	})
+	e.commit(next, "peer", confirmed, true, dsChange{put: changed})
 	log.Printf("env %s: adopted a fresher copy from a peer (confirmed %s)", e.id, confirmed.UTC().Format(time.RFC3339))
 }
 
@@ -873,9 +975,10 @@ func (e *env) subscribe(proto int, peer bool) (s *subscriber, put []byte, confir
 	s = &subscriber{proto: proto, peer: peer, ch: make(chan []byte, subscriberQueue), kick: make(chan struct{})}
 	e.subs[s] = struct{}{}
 	confirmed, upstream = e.peerStateLocked()
-	put = e.putMsgs()[proto]
 	if peer {
-		put = append(peerTag("relay-next", confirmed, upstream), put...)
+		put = append(peerTag("relay-next", confirmed, upstream), e.putMsgs()[proto]...)
+	} else {
+		put = putMsgsFor(e.viewPayload, e.view)[proto]
 	}
 	return s, put, confirmed, upstream
 }
@@ -906,10 +1009,15 @@ func (e *env) unsubscribe(s *subscriber) {
 	e.mu.Unlock()
 }
 
-func (e *env) broadcastLocked(msgs [2][]byte) {
+// broadcastLocked queues raw (source data) for peer streams and sdk (the
+// view) for SDK streams.
+func (e *env) broadcastLocked(raw, sdk [2][]byte) {
 	var pc []byte
 	for s := range e.subs {
-		msg := msgs[s.proto]
+		msg := sdk[s.proto]
+		if s.peer {
+			msg = raw[s.proto]
+		}
 		if msg == nil {
 			continue
 		}
@@ -955,12 +1063,23 @@ func (e *env) peerStateLocked() (time.Time, string) {
 	return e.confirmedAt, "disconnected"
 }
 
-func (e *env) putMsgs() [2][]byte {
-	all := make([]byte, 0, len(e.payload)+48)
+func (e *env) putMsgs() [2][]byte { return putMsgsFor(e.payload, e.data) }
+
+// putMsgsFor renders the put of ds for both stream protocols; payload is
+// ds.marshal() when the caller has it (nil: computed).
+func putMsgsFor(payload []byte, ds *dataSet) [2][]byte {
+	if ds == nil {
+		ds = newDataSet()
+		payload = nil
+	}
+	if payload == nil {
+		payload = ds.marshal()
+	}
+	all := make([]byte, 0, len(payload)+48)
 	all = append(all, "event: put\ndata: {\"path\":\"/\",\"data\":"...)
-	all = append(all, e.payload...)
+	all = append(all, payload...)
 	all = append(all, "}\n\n"...)
-	flags := e.data.marshalFlags()
+	flags := ds.marshalFlags()
 	legacy := make([]byte, 0, len(flags)+48)
 	legacy = append(legacy, "event: put\ndata: {\"path\":\"/\",\"data\":"...)
 	legacy = append(legacy, flags...)
@@ -988,11 +1107,20 @@ func deleteMsgs(kind, key string, version uint64) [2][]byte {
 	return out
 }
 
-func (e *env) snapshot() (ds *dataSet, payload []byte, etag string, confirmed time.Time, upstream string) {
+// snapshot returns the source data (peer: true) or the view served to SDKs.
+func (e *env) snapshot(peer bool) (ds *dataSet, payload []byte, etag string, confirmed time.Time, upstream string) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	confirmed, upstream = e.peerStateLocked()
-	return e.data, e.payload, e.etag, confirmed, upstream
+	if peer {
+		return e.data, e.payload, e.etag, confirmed, upstream
+	}
+	if e.view == nil { // override-only service lost its last override
+		ds = newDataSet()
+		payload = ds.marshal()
+		return ds, payload, etagOf(payload), confirmed, upstream
+	}
+	return e.view, e.viewPayload, e.viewEtag, confirmed, upstream
 }
 
 // awaitData blocks until the env can answer a request:
@@ -1000,12 +1128,15 @@ func (e *env) snapshot() (ds *dataSet, payload []byte, etag string, confirmed ti
 //   - data only from disk/peer: up to initWait for fresh data, unless the
 //     chain has already failed since start (then at once);
 //   - no data: up to firstWait for the first put; once the chain has failed,
-//     the peers are asked; then 503 (retryable).
-func (e *env) awaitData(ctx context.Context) (int, error) {
+//     the peers are asked; then 503 (retryable), unless local overrides
+//     exist: an SDK (never a peer) is then served the overrides alone, so an
+//     air-gapped relay that never reached upstream still serves them.
+func (e *env) awaitData(ctx context.Context, peer bool) (int, error) {
 	start := time.Now()
 	for {
 		e.mu.Lock()
 		hasData, source, tried, authFailed, peersTried := e.data != nil, e.source, e.triedOnce, e.authFailed, e.peersTried
+		overridesOnly := !peer && e.view != nil
 		ch := e.changed
 		e.mu.Unlock()
 		live := source == "upstream" || source == "primary"
@@ -1017,6 +1148,8 @@ func (e *env) awaitData(ctx context.Context) (int, error) {
 		case !hasData && tried && e.r.peers != nil && !peersTried:
 			e.syncPeers(ctx)
 			continue
+		case !hasData && (tried || time.Since(start) >= e.r.cfg.firstWait) && overridesOnly:
+			return http.StatusOK, nil
 		case !hasData && tried:
 			return http.StatusServiceUnavailable, errors.New("no flag data yet and upstream is unreachable")
 		case !hasData && time.Since(start) >= e.r.cfg.firstWait:

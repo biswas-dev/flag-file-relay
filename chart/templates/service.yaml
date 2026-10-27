@@ -4,4 +4,22 @@ metadata:
   name: {{ .Release.Name }}
 spec:
   selector: { app: {{ .Release.Name }} }
-  ports: [{ port: {{ .Values.port }}, targetPort: {{ .Values.port }} }]
+  ports:
+    - { name: sdk, port: {{ .Values.port }}, targetPort: {{ .Values.port }} }
+    {{- if .Values.admin.enabled }}
+    - { name: admin, port: {{ .Values.admin.port }}, targetPort: {{ .Values.admin.port }} }
+    {{- end }}
+{{- if .Values.admin.enabled }}
+---
+# Headless: resolves to every replica, so they can exchange overrides.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}-peer
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector: { app: {{ .Release.Name }} }
+  ports:
+    - { name: peer, port: {{ .Values.peerPort }}, targetPort: {{ .Values.peerPort }} }
+{{- end }}

@@ -22,12 +22,41 @@ spec:
             - { name: FLAGS_FILE, value: /etc/flags/flags.yaml }
             - { name: PORT, value: "{{ .Values.port }}" }
             - { name: SDK_KEY, value: "{{ .Values.sdkKey }}" }
-          ports: [{ containerPort: {{ .Values.port }} }]
+            {{- if .Values.admin.enabled }}
+            - { name: ADMIN_PORT, value: "{{ .Values.admin.port }}" }
+            - name: RELAY_ADMIN_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.admin.existingSecret | default (printf "%s-admin" .Release.Name) }}
+                  key: {{ .Values.admin.secretKey }}
+            - { name: CACHE_DIR, value: "{{ .Values.persistence.mountPath }}" }
+            - { name: PEER_PORT, value: "{{ .Values.peerPort }}" }
+            - { name: PEER_DNS, value: "{{ .Release.Name }}-peer.{{ .Release.Namespace }}.svc.cluster.local" }
+            - name: POD_IP
+              valueFrom: { fieldRef: { fieldPath: status.podIP } }
+            {{- end }}
+          ports:
+            - { name: sdk, containerPort: {{ .Values.port }} }
+            {{- if .Values.admin.enabled }}
+            - { name: admin, containerPort: {{ .Values.admin.port }} }
+            - { name: peer, containerPort: {{ .Values.peerPort }} }
+            {{- end }}
           volumeMounts:
             - { name: flags, mountPath: /etc/flags, readOnly: true }
+            {{- if .Values.admin.enabled }}
+            - { name: data, mountPath: "{{ .Values.persistence.mountPath }}" }
+            {{- end }}
           readinessProbe:
             httpGet: { path: /health, port: {{ .Values.port }} }
           resources: {{ toYaml .Values.resources | nindent 12 }}
       volumes:
         - name: flags
           configMap: { name: {{ .Release.Name }}-flags }
+        {{- if .Values.admin.enabled }}
+        - name: data
+          {{- if .Values.persistence.existingClaim }}
+          persistentVolumeClaim: { claimName: {{ .Values.persistence.existingClaim }} }
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+        {{- end }}

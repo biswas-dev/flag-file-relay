@@ -110,7 +110,19 @@ func writeCacheFile(dir, hash string, payload []byte, origin string, confirmedAt
 	if err != nil {
 		return err
 	}
-	tmp, err := os.CreateTemp(dir, "."+hash[:8]+"-*.tmp")
+	return writeFileDurable(dir, hash+".json", "."+hash[:8]+"-*.tmp", b, func() {
+		if h := testWriteHook.Load(); h != nil {
+			(*h)(hash)
+		}
+	})
+}
+
+// writeFileDurable replaces dir/name with b so that either the old or the new
+// content survives a crash or power loss: temp file, fsync, chmod 0600,
+// rename, fsync the directory. beforeRename (optional) runs just before the
+// rename (tests use it to simulate a slow disk).
+func writeFileDurable(dir, name, tmpPattern string, b []byte, beforeRename func()) error {
+	tmp, err := os.CreateTemp(dir, tmpPattern)
 	if err != nil {
 		return err
 	}
@@ -130,10 +142,10 @@ func writeCacheFile(dir, hash string, payload []byte, origin string, confirmedAt
 	if err := os.Chmod(tmpName, 0o600); err != nil {
 		return err
 	}
-	if h := testWriteHook.Load(); h != nil {
-		(*h)(hash)
+	if beforeRename != nil {
+		beforeRename()
 	}
-	if err := os.Rename(tmpName, filepath.Join(dir, hash+".json")); err != nil {
+	if err := os.Rename(tmpName, filepath.Join(dir, name)); err != nil {
 		return err
 	}
 	d, err := os.Open(dir)

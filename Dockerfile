@@ -1,5 +1,5 @@
 # Static, no-CGO binary on an empty base: ~10 MB, no shell, runs as uid 1001.
-FROM golang:1.23-alpine AS build
+FROM golang:1.27.3-alpine AS build
 RUN apk add --no-cache ca-certificates
 WORKDIR /src
 COPY go.mod go.sum ./
