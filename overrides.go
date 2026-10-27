@@ -135,7 +135,41 @@ func validOverrideValue(v json.RawMessage) error {
 	if !json.Valid(t) {
 		return fmt.Errorf("value is not valid JSON")
 	}
+	if d := jsonDepth(t); d > maxValueDepth {
+		return fmt.Errorf("value nested %d levels deep (limit %d)", d, maxValueDepth)
+	}
 	return scanJSON(t)
+}
+
+// maxValueDepth leaves room, under the strictest SDK's 128-level limit, for
+// the envelope a value is served in ({"data":{"flags":{key:{"variations":[v]}}}}).
+const maxValueDepth = 112
+
+func jsonDepth(b []byte) int {
+	depth, max := 0, 0
+	inStr, esc := false, false
+	for _, c := range b {
+		switch {
+		case inStr:
+			if esc {
+				esc = false
+			} else if c == '\\' {
+				esc = true
+			} else if c == '"' {
+				inStr = false
+			}
+		case c == '"':
+			inStr = true
+		case c == '{' || c == '[':
+			depth++
+			if depth > max {
+				max = depth
+			}
+		case c == '}' || c == ']':
+			depth--
+		}
+	}
+	return max
 }
 
 type overrideMap = map[string]*overrideRecord
@@ -636,9 +670,25 @@ func overriddenFlag(key string, base jsonObj, value json.RawMessage, version uin
 	}
 	f["version"] = json.RawMessage(fmt.Sprint(version))
 	f["on"] = json.RawMessage("true")
-	f["variations"] = json.RawMessage("[" + string(bytes.TrimSpace(value)) + "]")
-	f["offVariation"] = json.RawMessage("0")
-	f["fallthrough"] = json.RawMessage(`{"variation":0}`)
+	// Keep the source's variations (and so their indices: a prerequisite on
+	// this flag names a variation index) and serve the one equal to value,
+	// appending value when the source has no such variation.
+	vars, _ := asArr(f["variations"])
+	idx := -1
+	for i, v := range vars {
+		if jsonEqual(v, value) {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		vars = append(vars, json.RawMessage(bytes.TrimSpace(value)))
+		idx = len(vars) - 1
+	}
+	vb, _ := json.Marshal(vars)
+	f["variations"] = vb
+	f["offVariation"] = json.RawMessage(fmt.Sprint(idx))
+	f["fallthrough"] = json.RawMessage(fmt.Sprintf(`{"variation":%d}`, idx))
 	f["targets"] = json.RawMessage("[]")
 	f["contextTargets"] = json.RawMessage("[]")
 	f["rules"] = json.RawMessage("[]")
@@ -780,4 +830,18 @@ func diffMsgs(old, view *dataSet, keys, must []string) [2][]byte {
 		}
 	}
 	return concatMsgs(parts...)
+}
+
+// jsonEqual compares two JSON values semantically (key order, spacing).
+func jsonEqual(a, b json.RawMessage) bool {
+	var x, y interface{}
+	da, db := json.NewDecoder(bytes.NewReader(a)), json.NewDecoder(bytes.NewReader(b))
+	da.UseNumber()
+	db.UseNumber()
+	if da.Decode(&x) != nil || db.Decode(&y) != nil {
+		return false
+	}
+	xb, _ := json.Marshal(x)
+	yb, _ := json.Marshal(y)
+	return bytes.Equal(xb, yb)
 }

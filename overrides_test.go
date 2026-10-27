@@ -211,27 +211,27 @@ func TestOverrideServedOnEverySDKEndpoint(t *testing.T) {
 
 	putOverride(t, n.admin.URL, "a", `{"value":false,"set_by":"ops@example.com"}`)
 	ev := sAll.next(t)
-	if ev.Name != "patch" || !strings.Contains(ev.Data, `"/flags/a"`) || !strings.Contains(ev.Data, `"variations":[false]`) {
+	if ev.Name != "patch" || !strings.Contains(ev.Data, `"/flags/a"`) || eventValue(t, ev) != "false" {
 		t.Fatalf("stream: want patch of a to false, got %+v", ev)
 	}
 	if v := eventVersion(t, ev); v <= 5 {
 		t.Fatalf("patch version %d must be above the version the SDK holds (5)", v)
 	}
-	if ev := sLegacy.next(t); ev.Name != "patch" || !strings.Contains(ev.Data, `"path":"/a"`) || !strings.Contains(ev.Data, `[false]`) {
+	if ev := sLegacy.next(t); ev.Name != "patch" || !strings.Contains(ev.Data, `"path":"/a"`) || eventValue(t, ev) != "false" {
 		t.Fatalf("legacy stream: %+v", ev)
 	}
 	if v := valueOf(t, n.sdk.URL, "a"); v != "false" {
 		t.Fatalf("/sdk/latest-all a = %s, want false", v)
 	}
-	if code, body, _ := get(t, n.sdk.URL+"/sdk/latest-flags/a", testKey); code != 200 || !strings.Contains(body, `"variations":[false]`) {
+	if code, body, _ := get(t, n.sdk.URL+"/sdk/latest-flags/a", testKey); code != 200 || string(defaultValue(json.RawMessage(body)).Value) != "false" {
 		t.Fatalf("/sdk/latest-flags/a: %d %s", code, body)
 	}
-	if code, body, _ := get(t, n.sdk.URL+"/sdk/latest-flags", testKey); code != 200 || !strings.Contains(body, `"variations":[false]`) {
+	if code, body, _ := get(t, n.sdk.URL+"/sdk/latest-flags", testKey); code != 200 || putValue(t, sseEvent{Data: `{"data":` + body + `}`}, "a") != "false" {
 		t.Fatalf("/sdk/latest-flags: %d %s", code, body)
 	}
 	// A new stream gets the override in its put.
 	s2 := openStream(t, n.sdk.URL, testKey)
-	if ev := s2.next(t); ev.Name != "put" || !strings.Contains(ev.Data, `"variations":[false]`) {
+	if ev := s2.next(t); ev.Name != "put" || putValue(t, ev, "a") != "false" {
 		t.Fatalf("new stream put: %+v", ev)
 	}
 	// Peers always get the source data.
@@ -264,7 +264,7 @@ func TestOverrideServedOnEverySDKEndpoint(t *testing.T) {
 		t.Fatalf("DELETE: %d %s", code, body)
 	}
 	ev = sAll.next(t)
-	if ev.Name != "patch" || !strings.Contains(ev.Data, `"variations":[true,false]`) || eventVersion(t, ev) <= before {
+	if ev.Name != "patch" || eventValue(t, ev) != "true" || eventVersion(t, ev) <= before {
 		t.Fatalf("after reset want upstream flag above v%d, got %+v", before, ev)
 	}
 	if v := valueOf(t, n.sdk.URL, "a"); v != "true" {
@@ -391,9 +391,9 @@ func TestUpstreamChangeReplacesOverride(t *testing.T) {
 		t.Logf("event %s %s", ev.Name, ev.Data)
 		switch {
 		case strings.Contains(ev.Data, `"/flags/a"`):
-			sawA = strings.Contains(ev.Data, `"variations":[true,false]`)
+			sawA = eventValue(t, ev) == "true"
 		case strings.Contains(ev.Data, `"/flags/b"`):
-			sawB = strings.Contains(ev.Data, `"variations":[false]`)
+			sawB = eventValue(t, ev) == "false"
 		}
 	}
 	if !sawA || !sawB {
@@ -500,7 +500,7 @@ func TestOverrideReplication(t *testing.T) {
 	if !strings.Contains(body, `"replicated":1`) {
 		t.Fatalf("PUT on primary: %s", body)
 	}
-	if ev := sF.next(t); ev.Name != "patch" || !strings.Contains(ev.Data, `[false]`) {
+	if ev := sF.next(t); ev.Name != "patch" || eventValue(t, ev) != "false" {
 		t.Fatalf("follower SDK stream: %+v", ev)
 	}
 	// The follower still streams the source data from the primary.
@@ -676,7 +676,7 @@ func TestFileModeOverrides(t *testing.T) {
 	st := openStream(t, sdk.URL, "any")
 	st.next(t)
 	putOverride(t, adm.URL, "new-rbac", `{"value":true}`)
-	if ev := st.next(t); ev.Name != "patch" || !strings.Contains(ev.Data, `"variations":[true]`) || eventVersion(t, ev) <= 1 {
+	if ev := st.next(t); ev.Name != "patch" || eventValue(t, ev) != "true" || eventVersion(t, ev) <= 1 {
 		t.Fatalf("file mode patch: %+v", ev)
 	}
 	putOverride(t, adm.URL, "log-levels", `{"value":{"version":1,"services":{}},"local_only":true}`)
@@ -694,7 +694,7 @@ func TestFileModeOverrides(t *testing.T) {
 	if err := s.rebuild(); err != nil {
 		t.Fatal(err)
 	}
-	if ev := st.next(t); ev.Name != "put" || !strings.Contains(ev.Data, `"other"`) || !strings.Contains(ev.Data, `"variations":[30]`) {
+	if ev := st.next(t); ev.Name != "put" || !strings.Contains(ev.Data, `"other"`) || putValue(t, ev, "max") != "30" {
 		t.Fatalf("file reload put: %+v", ev)
 	}
 	code, body, _ := adminDo(t, http.MethodGet, adm.URL+"/admin/flags", "")
@@ -702,7 +702,7 @@ func TestFileModeOverrides(t *testing.T) {
 		t.Fatalf("list: %d %s", code, body)
 	}
 	adminDo(t, http.MethodDelete, adm.URL+"/admin/flags/new-rbac/override", "")
-	if ev := st.next(t); ev.Name != "patch" || !strings.Contains(ev.Data, `"variations":[false]`) {
+	if ev := st.next(t); ev.Name != "patch" || eventValue(t, ev) != "false" {
 		t.Fatalf("reset patch: %+v", ev)
 	}
 	// Restart: overrides come back from disk.
@@ -764,7 +764,7 @@ func TestConcurrentOverrideChangesAllAnnounced(t *testing.T) {
 	for i := 0; i < 2; i++ {
 		ev := s.next(t)
 		for _, k := range []string{"a", "b"} {
-			if ev.Name == "patch" && strings.Contains(ev.Data, `"/flags/`+k+`"`) && strings.Contains(ev.Data, `[false]`) {
+			if ev.Name == "patch" && strings.Contains(ev.Data, `"/flags/`+k+`"`) && eventValue(t, ev) == "false" {
 				got[k] = true
 			}
 		}
@@ -853,7 +853,7 @@ func TestFileModeOverrideSurvivesAddingTheFlag(t *testing.T) {
 	if !s.overrides.get("y").live() {
 		t.Fatal("adding the flag to the file dropped the override")
 	}
-	if it := s.view.Flags["y"]; !strings.Contains(string(it.Raw), `"variations":["local"]`) {
+	if it := s.view.Flags["y"]; string(defaultValue(it.Raw).Value) != `"local"` {
 		t.Fatalf("y served %s", it.Raw)
 	}
 }
@@ -914,5 +914,68 @@ func TestOverrideAggregateLimit(t *testing.T) {
 	}
 	if err == nil {
 		t.Fatal("aggregate value size not bounded")
+	}
+}
+
+// eventValue is the value a patch event's flag serves a context without
+// targeting.
+func eventValue(t *testing.T, ev sseEvent) string {
+	t.Helper()
+	var m struct {
+		Data json.RawMessage `json:"data"`
+	}
+	if err := json.Unmarshal([]byte(ev.Data), &m); err != nil {
+		t.Fatalf("event %q: %v", ev.Data, err)
+	}
+	si := defaultValue(m.Data)
+	if si == nil {
+		return "<none>"
+	}
+	return string(si.Value)
+}
+
+// putValue is the value of flag key in a put event (both stream protocols).
+func putValue(t *testing.T, ev sseEvent, key string) string {
+	t.Helper()
+	var m struct {
+		Data json.RawMessage `json:"data"`
+	}
+	if err := json.Unmarshal([]byte(ev.Data), &m); err != nil {
+		t.Fatal(err)
+	}
+	var all struct {
+		Flags map[string]json.RawMessage `json:"flags"`
+	}
+	if json.Unmarshal(m.Data, &all) != nil || all.Flags == nil {
+		json.Unmarshal(m.Data, &all.Flags)
+	}
+	raw, ok := all.Flags[key]
+	if !ok {
+		return "<absent>"
+	}
+	return string(defaultValue(raw).Value)
+}
+
+// Codex r7: the source's variation indices are kept (prerequisites name an
+// index), and values too deeply nested for the SDK envelope are refused.
+func TestOverrideKeepsVariationIndices(t *testing.T) {
+	src, _ := asObj(json.RawMessage(`{"key":"f","version":1,"on":true,"variations":[false,true],"offVariation":0,"fallthrough":{"variation":0},"targets":[],"rules":[],"prerequisites":[],"salt":"f"}`))
+	it := overriddenFlag("f", src, json.RawMessage(`true`), 2)
+	o, _ := asObj(it.Raw)
+	if string(o["variations"]) != `[false,true]` || string(o["fallthrough"]) != `{"variation":1}` {
+		t.Fatalf("variations %s fallthrough %s", o["variations"], o["fallthrough"])
+	}
+	it = overriddenFlag("f", src, json.RawMessage(`"new"`), 2)
+	o, _ = asObj(it.Raw)
+	if string(o["variations"]) != `[false,true,"new"]` || string(o["fallthrough"]) != `{"variation":2}` {
+		t.Fatalf("appended: variations %s fallthrough %s", o["variations"], o["fallthrough"])
+	}
+	deep := strings.Repeat("[", 120) + strings.Repeat("]", 120)
+	if validOverrideValue(json.RawMessage(deep)) == nil {
+		t.Fatal("a value too deep for the SDK envelope was accepted")
+	}
+	ok := strings.Repeat("[", 100) + strings.Repeat("]", 100)
+	if err := validOverrideValue(json.RawMessage(ok)); err != nil {
+		t.Fatal(err)
 	}
 }
