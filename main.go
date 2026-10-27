@@ -257,20 +257,22 @@ func (s *server) applyOverrides(keys []string) {
 		return
 	}
 	old := s.view
-	v, bump := monotonic(old, s.raw, s.overrides.snapshot(), s.bump, keys)
+	ovs := s.overrides.snapshot()
+	all := overlayKeys(keys, ovs, s.bump)
+	v, bump := monotonic(old, s.raw, ovs, s.bump, all)
 	s.bump = bump
 	s.setViewLocked(v)
-	var parts [][2][]byte
-	for _, k := range keys {
-		o, oOK := old.Flags[k]
-		n, nOK := s.view.Flags[k]
-		if !sameItem(o, oOK, n, nOK) {
-			parts = append(parts, itemMsgs(s.view, k))
-		}
+	if msgs := diffMsgs(old, s.view, all, nil); msgs[0] != nil || msgs[1] != nil {
+		s.broadcastLocked(msgs)
 	}
-	if len(parts) > 0 {
-		s.broadcastLocked(concatMsgs(parts...))
-	}
+}
+
+// reconcile (overrideHost) checks the overrides against the file's flags.
+func (s *server) reconcile() []string {
+	s.mu.Lock()
+	raw := s.raw
+	s.mu.Unlock()
+	return s.overrides.observe("file", raw, time.Now())
 }
 
 func (s *server) sourceVersions(key string) map[string]uint64 {

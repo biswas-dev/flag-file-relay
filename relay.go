@@ -874,3 +874,16 @@ func (r *relay) adminEnvs() []adminEnv {
 	r.mu.Unlock()
 	return out
 }
+
+// reconcile runs observe for every environment with data (an override merged
+// from a peer may be older than the source data held here).
+func (r *relay) reconcile() []string {
+	var dropped []string
+	for _, e := range r.envList() {
+		e.mu.Lock()
+		ds := e.data
+		e.mu.Unlock()
+		dropped = append(dropped, r.overrides.observe(e.hash, ds, time.Now())...)
+	}
+	return dropped
+}

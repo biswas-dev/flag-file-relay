@@ -68,6 +68,21 @@ type overrideHost interface {
 	sourceVersions(key string) map[string]uint64
 	// applyOverrides re-serves keys after an override change.
 	applyOverrides(keys []string)
+	// reconcile checks the overrides against the source data held now
+	// (observe) and returns the overrides it dropped.
+	reconcile() []string
+}
+
+// adopt merges records from a peer, then checks them against the source
+// data this replica already holds: an override set elsewhere against an older
+// source version than ours is dropped here and now, not at our next change.
+func (a *overrideAdmin) adopt(in overrideMap) {
+	changed := a.store.merge(in)
+	if len(changed) == 0 {
+		return
+	}
+	dropped := a.host.reconcile()
+	a.host.applyOverrides(append(changed, dropped...))
 }
 
 type overrideAdmin struct {
@@ -495,9 +510,7 @@ func (a *overrideAdmin) handlePeer(w http.ResponseWriter, req *http.Request) {
 			http.Error(w, "bad body", http.StatusBadRequest)
 			return
 		}
-		if changed := a.store.merge(in.Overrides); len(changed) > 0 {
-			a.host.applyOverrides(changed)
-		}
+		a.adopt(in.Overrides)
 		w.WriteHeader(http.StatusNoContent)
 	default:
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -586,9 +599,7 @@ func (a *overrideAdmin) pull(ctx context.Context) int {
 	}
 	wg.Wait()
 	for _, m := range all {
-		if changed := a.store.merge(m); len(changed) > 0 {
-			a.host.applyOverrides(changed)
-		}
+		a.adopt(m)
 	}
 	return answered
 }

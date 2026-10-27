@@ -746,3 +746,56 @@ func TestSharedAdminAndPeerListener(t *testing.T) {
 		t.Fatalf("peer snapshot on the shared listener: %d", code)
 	}
 }
+
+// Codex r1 #1: a rebuild that takes in two override changes announces both,
+// even if only one notification is delivered (the other then finds nothing).
+func TestConcurrentOverrideChangesAllAnnounced(t *testing.T) {
+	up := newMockUpstream(t, dataJSON(flagJSON("a", 1, true), flagJSON("b", 1, true)))
+	n := startNode(t, testConfig(up.srv.URL, t.TempDir()), nil, nil)
+	s := openStream(t, n.sdk.URL, testKey)
+	s.next(t)
+	// Both stored before any env is notified; only a's notification runs first.
+	n.r.overrides.set("a", json.RawMessage(`false`), "", false, "", n.r.sourceVersions("a"))
+	n.r.overrides.set("b", json.RawMessage(`false`), "", false, "", n.r.sourceVersions("b"))
+	n.r.applyOverrides([]string{"a"})
+	n.r.applyOverrides([]string{"b"})
+	got := map[string]bool{}
+	for i := 0; i < 2; i++ {
+		ev := s.next(t)
+		for _, k := range []string{"a", "b"} {
+			if ev.Name == "patch" && strings.Contains(ev.Data, `"/flags/`+k+`"`) && strings.Contains(ev.Data, `[false]`) {
+				got[k] = true
+			}
+		}
+	}
+	if !got["a"] || !got["b"] {
+		t.Fatalf("announced %v, want both a and b", got)
+	}
+}
+
+// Codex r1 #2: an override replicated from a peer that was set against an
+// older source version than this replica holds is dropped on arrival.
+func TestReplicatedOverrideOlderThanLocalSourceDropped(t *testing.T) {
+	up := newMockUpstream(t, dataJSON(flagJSON("a", 2, true), flagJSON("b", 2, true)))
+	n := startNode(t, testConfig(up.srv.URL, t.TempDir()), nil, nil)
+	get(t, n.sdk.URL+"/sdk/latest-all", testKey)
+	h := keyHash(testKey)
+	rev := uint64(time.Now().UnixMilli())
+	n.r.admin.adopt(overrideMap{
+		"a": {Value: json.RawMessage(`false`), Rev: rev, Origin: "peer", Upstream: map[string]uint64{h: 1}},                  // older than our v2
+		"b": {Value: json.RawMessage(`false`), Rev: rev, Origin: "peer", Upstream: map[string]uint64{h: 2}},                  // current
+		"c": {Value: json.RawMessage(`false`), Rev: rev, Origin: "peer", Upstream: map[string]uint64{h: 0}, LocalOnly: false}, // synthesized
+	})
+	if n.r.overrides.get("a").live() {
+		t.Fatal("an override set against an older source version must be dropped")
+	}
+	if v := valueOf(t, n.sdk.URL, "a"); v != "true" {
+		t.Fatalf("a = %s, want the source value", v)
+	}
+	if v := valueOf(t, n.sdk.URL, "b"); v != "false" {
+		t.Fatalf("b = %s, want the override", v)
+	}
+	if v := valueOf(t, n.sdk.URL, "c"); v != "false" {
+		t.Fatalf("c = %s, want the synthesized override", v)
+	}
+}

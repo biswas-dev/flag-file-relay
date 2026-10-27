@@ -167,25 +167,23 @@ func (e *env) overridesChanged(keys []string) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	old := e.view
-	e.rebuildViewLocked(keys, false)
-	if old != nil {
-		var parts [][2][]byte
-		for _, k := range keys {
-			o, oOK := old.Flags[k]
-			var n item
-			var nOK bool
-			if e.view != nil {
-				n, nOK = e.view.Flags[k]
-			}
-			if !sameItem(o, oOK, n, nOK) {
-				parts = append(parts, itemMsgs(e.view, k))
-			}
-		}
-		if len(parts) > 0 {
-			e.broadcastLocked([2][]byte{}, concatMsgs(parts...))
-		}
+	sdk := e.refreshViewLocked(keys)
+	if old != nil && (sdk[0] != nil || sdk[1] != nil) {
+		e.broadcastLocked([2][]byte{}, sdk)
 	}
 	e.notifyLocked() // an env without data may now be servable (override only)
+}
+
+// refreshViewLocked rebuilds the view after a change and returns the SDK
+// events for every flag whose served form changed: the keys in must, and any
+// other overridden (or version-offset) flag, since the rebuild also takes in
+// override changes made concurrently, whose own notification then finds
+// nothing left to announce.
+func (e *env) refreshViewLocked(must []string) [2][]byte {
+	old := e.view
+	keys := overlayKeys(must, e.r.overrides.snapshot(), e.bump)
+	e.rebuildViewLocked(keys, false)
+	return diffMsgs(old, e.view, keys, must)
 }
 
 func (e *env) isFollower() bool { return e.r.cfg.primaryURI != "" }
@@ -259,6 +257,7 @@ func (e *env) commit(next *dataSet, source string, confirmed time.Time, fences b
 	if fences {
 		e.extEpoch++
 	}
+	plain := e.view == e.data && len(e.bump) == 0 // nothing overlaid before this change
 	e.setDataLocked(next, source)
 	e.confirmedAt = confirmed
 	var raw, sdk [2][]byte
@@ -285,29 +284,17 @@ func (e *env) commit(next *dataSet, source string, confirmed time.Time, fences b
 				}
 			}
 		}
-		e.rebuildViewLocked(keys, false)
-		sdk = raw
-		if e.view != e.data || len(dropped) > 0 {
-			var parts [][2][]byte
-			if ch.kind != "flags" {
-				parts = append(parts, raw)
-			}
-			for _, k := range keys {
-				parts = append(parts, itemMsgs(e.view, k))
-			}
-			sdk = concatMsgs(parts...)
+		msgs := e.refreshViewLocked(keys)
+		switch {
+		case plain && e.view == e.data:
+			sdk = raw
+		case ch.kind != "flags":
+			sdk = concatMsgs(raw, msgs)
+		default:
+			sdk = msgs
 		}
 	default:
-		if len(dropped) > 0 {
-			e.rebuildViewLocked(dropped, false)
-			var parts [][2][]byte
-			for _, k := range dropped {
-				parts = append(parts, itemMsgs(e.view, k))
-			}
-			sdk = concatMsgs(parts...)
-		} else {
-			e.rebuildViewLocked(nil, false)
-		}
+		sdk = e.refreshViewLocked(dropped)
 	}
 	e.broadcastLocked(raw, sdk)
 	e.notifyLocked()

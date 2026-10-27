@@ -701,3 +701,50 @@ func concatMsgs(parts ...[2][]byte) [2][]byte {
 	}
 	return out
 }
+
+// overlayKeys is must plus every flag the overlay may touch: every override
+// record (tombstones included) and every version offset.
+func overlayKeys(must []string, ovs overrideMap, bump map[string]uint64) []string {
+	seen := make(map[string]bool, len(must)+len(ovs)+len(bump))
+	out := make([]string, 0, len(must)+len(ovs)+len(bump))
+	add := func(k string) {
+		if !seen[k] {
+			seen[k] = true
+			out = append(out, k)
+		}
+	}
+	for _, k := range must {
+		add(k)
+	}
+	for k := range ovs {
+		add(k)
+	}
+	for k := range bump {
+		add(k)
+	}
+	return out
+}
+
+// diffMsgs renders the SDK events taking old to view for keys: one per flag
+// whose served form changed, and always one for the keys in must.
+func diffMsgs(old, view *dataSet, keys, must []string) [2][]byte {
+	always := make(map[string]bool, len(must))
+	for _, k := range must {
+		always[k] = true
+	}
+	var parts [][2][]byte
+	for _, k := range keys {
+		var o, n item
+		var oOK, nOK bool
+		if old != nil {
+			o, oOK = old.Flags[k]
+		}
+		if view != nil {
+			n, nOK = view.Flags[k]
+		}
+		if always[k] || !sameItem(o, oOK, n, nOK) {
+			parts = append(parts, itemMsgs(view, k))
+		}
+	}
+	return concatMsgs(parts...)
+}
