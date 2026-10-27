@@ -755,8 +755,8 @@ func TestConcurrentOverrideChangesAllAnnounced(t *testing.T) {
 	s := openStream(t, n.sdk.URL, testKey)
 	s.next(t)
 	// Both stored before any env is notified; only a's notification runs first.
-	n.r.overrides.set("a", json.RawMessage(`false`), "", false, "", n.r.sourceVersions("a"))
-	n.r.overrides.set("b", json.RawMessage(`false`), "", false, "", n.r.sourceVersions("b"))
+	n.r.overrides.set("a", json.RawMessage(`false`), "", false, "", func() map[string]uint64 { return n.r.sourceVersions("a") })
+	n.r.overrides.set("b", json.RawMessage(`false`), "", false, "", func() map[string]uint64 { return n.r.sourceVersions("b") })
 	n.r.applyOverrides([]string{"a"})
 	n.r.applyOverrides([]string{"b"})
 	got := map[string]bool{}
@@ -797,5 +797,21 @@ func TestReplicatedOverrideOlderThanLocalSourceDropped(t *testing.T) {
 	}
 	if v := valueOf(t, n.sdk.URL, "c"); v != "false" {
 		t.Fatalf("c = %s, want the synthesized override", v)
+	}
+}
+
+// Codex r2 #2: a revision clock ahead of wall time (after merging a peer's
+// revision) must not stop a later source change from replacing an override.
+func TestSourceChangeWinsWithClockAhead(t *testing.T) {
+	up := newMockUpstream(t, dataJSON(flagJSON("a", 1, true)))
+	n := startNode(t, testConfig(up.srv.URL, t.TempDir()), nil, nil)
+	s := openStream(t, n.sdk.URL, testKey)
+	s.next(t)
+	n.r.admin.adopt(overrideMap{"other": {Value: json.RawMessage(`1`), Rev: uint64(time.Now().Add(time.Hour).UnixMilli()), Origin: "peer"}})
+	putOverride(t, n.admin.URL, "a", `{"value":false}`)
+	up.send("event: patch\ndata: {\"path\":\"/flags/a\",\"data\":" + flagJSON("a", 2, true) + "}\n\n")
+	waitFor(t, "override dropped", func() bool { return !n.r.overrides.get("a").live() })
+	if v := valueOf(t, n.sdk.URL, "a"); v != "true" {
+		t.Fatalf("a = %s, want the source value", v)
 	}
 }

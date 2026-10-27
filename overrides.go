@@ -331,9 +331,11 @@ func matches(cur *overrideRecord, ifMatch string) bool {
 	return ifMatch == fmt.Sprint(rev)
 }
 
-// set creates or replaces the override of key. base gives the source flag
-// version per environment at this moment.
-func (s *overrideStore) set(key string, value json.RawMessage, setBy string, localOnly bool, ifMatch string, base map[string]uint64) (*overrideRecord, error) {
+// set creates or replaces the override of key. base returns the source flag
+// version per environment; it runs under mu, and every commit of source data
+// observes and publishes under mu too (observe), so the versions it reads are
+// exactly the data served when the override takes effect.
+func (s *overrideStore) set(key string, value json.RawMessage, setBy string, localOnly bool, ifMatch string, base func() map[string]uint64) (*overrideRecord, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	cur := s.snapshot()
@@ -345,7 +347,10 @@ func (s *overrideStore) set(key string, value json.RawMessage, setBy string, loc
 	}
 	rec := &overrideRecord{
 		Value: append(json.RawMessage(nil), bytes.TrimSpace(value)...), SetBy: setBy, SetAt: time.Now().UTC(),
-		LocalOnly: localOnly, Rev: s.tick(), Origin: s.origin, Upstream: base,
+		LocalOnly: localOnly, Rev: s.tick(), Origin: s.origin,
+	}
+	if base != nil {
+		rec.Upstream = base()
 	}
 	next := copyMap(cur)
 	next[key] = rec
@@ -453,17 +458,26 @@ func (s *overrideStore) merge(in overrideMap) []string {
 // observe compares the source data of one environment with the overrides:
 // it records the source version for overrides that have none for this
 // environment yet, and drops (non local_only) overrides whose flag the source
-// has changed since. since is when the caller started applying ds: an
-// override made at or after that moment was set against older data than ds,
-// so it is re-based instead of dropped. Returns the dropped keys.
-func (s *overrideStore) observe(envID string, ds *dataSet, since time.Time) []string {
+// has changed since they were set. apply (optional) runs, with the dropped
+// keys, before mu is released: it makes ds the served data, so no override can
+// be set between this check and ds being served (set reads its baselines
+// under mu), and "the source version is higher than the baseline" always
+// means the source changed after the override. Returns the dropped keys.
+func (s *overrideStore) observe(envID string, ds *dataSet, apply func(dropped []string)) []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	dropped := s.observeLocked(envID, ds)
+	if apply != nil {
+		apply(dropped)
+	}
+	return dropped
+}
+
+func (s *overrideStore) observeLocked(envID string, ds *dataSet) []string {
 	if ds == nil || countLive(s.snapshot()) == 0 {
 		return nil
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	cur := s.snapshot()
-	sinceMs := uint64(since.UnixMilli())
 	var next overrideMap
 	var dropped []string
 	for k, o := range cur {
@@ -478,7 +492,7 @@ func (s *overrideStore) observe(envID string, ds *dataSet, since time.Time) []st
 		switch {
 		case known && v == base:
 			continue
-		case known && v > base && !o.LocalOnly && o.Rev < sinceMs:
+		case known && v > base && !o.LocalOnly:
 			if next == nil {
 				next = copyMap(cur)
 			}
@@ -486,8 +500,7 @@ func (s *overrideStore) observe(envID string, ds *dataSet, since time.Time) []st
 			dropped = append(dropped, k)
 			log.Printf("override dropped: %s changed at the source (version %d, override set against %d); serving the source value", k, v, base)
 		case !known || v > base:
-			// First sight of this environment, a local_only override, or an
-			// override set while this data was being applied: re-base.
+			// First sight of this environment, or a local_only override: re-base.
 			if next == nil {
 				next = copyMap(cur)
 			}

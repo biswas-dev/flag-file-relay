@@ -13,6 +13,11 @@ spec:
       annotations:
         checksum/flags: {{ toYaml .Values.flags | sha256sum }}
     spec:
+      securityContext:
+        # The image runs as 1001:1001; fsGroup makes a mounted volume
+        # (persistence.existingClaim) writable for the overrides file.
+        runAsNonRoot: true
+        fsGroup: 1001
       containers:
         - name: relay
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"

@@ -883,7 +883,7 @@ func (r *relay) reconcile() []string {
 		e.mu.Lock()
 		ds := e.data
 		e.mu.Unlock()
-		dropped = append(dropped, r.overrides.observe(e.hash, ds, time.Now())...)
+		dropped = append(dropped, r.overrides.observe(e.hash, ds, nil)...)
 	}
 	return dropped
 }

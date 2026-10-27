@@ -218,7 +218,6 @@ type dsChange struct {
 // downstream. fences marks a change (poll or peer copy) that a stream's
 // initial put must not undo.
 func (e *env) commit(next *dataSet, source string, confirmed time.Time, fences bool, ch dsChange) {
-	started := time.Now()
 	// The confirmation stored on disk and the one published are the same:
 	// never older than what memory already holds (keepalives also take
 	// commitMu, so nothing can move it while this commit runs).
@@ -250,8 +249,17 @@ func (e *env) commit(next *dataSet, source string, confirmed time.Time, fences b
 		e.mu.Unlock()
 	}
 	// Overrides whose flag the source has changed since are dropped (last
-	// write wins), before the change is served.
-	dropped := e.r.overrides.observe(e.hash, next, started)
+	// write wins), and the change is served, under the override store's lock
+	// (see observe).
+	dropped := e.r.overrides.observe(e.hash, next, func(dropped []string) { e.publishLocked(next, source, confirmed, fences, ch, dropped) })
+	if len(dropped) > 0 {
+		e.r.overridesChanged(dropped, e) // every other environment serves the source again too
+	}
+}
+
+// publishLocked makes next the served data and sends the downstream events.
+// Called by commit from inside overrideStore.observe.
+func (e *env) publishLocked(next *dataSet, source string, confirmed time.Time, fences bool, ch dsChange, dropped []string) {
 	e.mu.Lock()
 	e.gen++
 	if fences {
@@ -299,9 +307,6 @@ func (e *env) commit(next *dataSet, source string, confirmed time.Time, fences b
 	e.broadcastLocked(raw, sdk)
 	e.notifyLocked()
 	e.mu.Unlock()
-	if len(dropped) > 0 {
-		e.r.overridesChanged(dropped, e) // every other environment serves the source again too
-	}
 }
 
 // persistRetryLoop rewrites the current data while the last write failed.

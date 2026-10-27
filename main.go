@@ -211,12 +211,13 @@ func (s *server) rebuild() error {
 	if len(ds.invalid) > 0 {
 		return fmt.Errorf("flags not servable: %v", ds.invalid)
 	}
-	s.overrides.observe("file", ds, time.Now())
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.rawJSON, s.raw, s.bump = b, ds, nil
-	s.setViewLocked(buildView(ds, s.overrides.snapshot(), nil))
-	s.broadcastLocked(putMsgsFor(s.payload, s.view))
+	s.overrides.observe("file", ds, func([]string) {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		s.rawJSON, s.raw, s.bump = b, ds, nil
+		s.setViewLocked(buildView(ds, s.overrides.snapshot(), nil))
+		s.broadcastLocked(putMsgsFor(s.payload, s.view))
+	})
 	return nil
 }
 
@@ -272,7 +273,7 @@ func (s *server) reconcile() []string {
 	s.mu.Lock()
 	raw := s.raw
 	s.mu.Unlock()
-	return s.overrides.observe("file", raw, time.Now())
+	return s.overrides.observe("file", raw, nil)
 }
 
 func (s *server) sourceVersions(key string) map[string]uint64 {

@@ -396,7 +396,7 @@ func (a *overrideAdmin) handlePut(w http.ResponseWriter, req *http.Request) {
 	if a.forward(w, req, b) {
 		return
 	}
-	_, err = a.store.set(key, body.Value, body.SetBy, body.LocalOnly, ifMatch(req), a.host.sourceVersions(key))
+	_, err = a.store.set(key, body.Value, body.SetBy, body.LocalOnly, ifMatch(req), func() map[string]uint64 { return a.host.sourceVersions(key) })
 	a.afterWrite(w, req, key, err)
 }
 
