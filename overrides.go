@@ -560,7 +560,7 @@ func (s *overrideStore) observeLocked(envID string, ds *dataSet) []string {
 			v, live = it.Version, !it.Deleted
 		}
 		base, known := o.Upstream[envID]
-		baseLive := !o.Gone[envID] && base > 0
+		baseLive := !o.Gone[envID]                         // version 0 is a valid live version
 		removed := known && v == base && baseLive && !live // deleted by a full snapshot, same version
 		switch {
 		case known && v == base && !removed:
@@ -859,13 +859,11 @@ func diffMsgs(old, view *dataSet, keys, must []string) [2][]byte {
 	return concatMsgs(parts...)
 }
 
-// jsonEqual compares two JSON values semantically (key order, spacing).
+// jsonEqual compares two JSON values semantically (key order, spacing, and
+// number spelling: 1.0 equals 1, as the SDKs compare them).
 func jsonEqual(a, b json.RawMessage) bool {
 	var x, y interface{}
-	da, db := json.NewDecoder(bytes.NewReader(a)), json.NewDecoder(bytes.NewReader(b))
-	da.UseNumber()
-	db.UseNumber()
-	if da.Decode(&x) != nil || db.Decode(&y) != nil {
+	if json.Unmarshal(a, &x) != nil || json.Unmarshal(b, &y) != nil {
 		return false
 	}
 	xb, _ := json.Marshal(x)

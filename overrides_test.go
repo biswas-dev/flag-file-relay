@@ -736,7 +736,7 @@ func TestSharedAdminAndPeerListener(t *testing.T) {
 	cfg.overridesFile = filepath.Join(cfg.cacheDir, "overrides.json")
 	cfg.peerAddrs = []string{"127.0.0.1:1"}
 	r, srv, _ := startRelay(t, cfg)
-	get(t, srv.URL+"/sdk/latest-all", testKey)
+	waitFor(t, "data", func() bool { code, _, _ := get(t, srv.URL+"/sdk/latest-all", testKey); return code == 200 })
 	h := httptest.NewServer(combinedMux(r.admin.mux(), r.peerMux()))
 	t.Cleanup(h.Close)
 	putOverride(t, h.URL, "a", `{"value":false}`)
@@ -783,9 +783,9 @@ func TestReplicatedOverrideOlderThanLocalSourceDropped(t *testing.T) {
 	h := keyHash(testKey)
 	rev := uint64(time.Now().UnixMilli())
 	n.r.admin.adopt(overrideMap{
-		"a": {Value: json.RawMessage(`false`), Rev: rev, Origin: "peer", Upstream: map[string]uint64{h: 1}},                   // older than our v2
-		"b": {Value: json.RawMessage(`false`), Rev: rev, Origin: "peer", Upstream: map[string]uint64{h: 2}},                   // current
-		"c": {Value: json.RawMessage(`false`), Rev: rev, Origin: "peer", Upstream: map[string]uint64{h: 0}, LocalOnly: false}, // synthesized
+		"a": {Value: json.RawMessage(`false`), Rev: rev, Origin: "peer", Upstream: map[string]uint64{h: 1}},                                 // older than our v2
+		"b": {Value: json.RawMessage(`false`), Rev: rev, Origin: "peer", Upstream: map[string]uint64{h: 2}},                                 // current
+		"c": {Value: json.RawMessage(`false`), Rev: rev, Origin: "peer", Upstream: map[string]uint64{h: 0}, Gone: map[string]bool{h: true}}, // synthesized
 	})
 	if n.r.overrides.get("a").live() {
 		t.Fatal("an override set against an older source version must be dropped")
@@ -998,5 +998,24 @@ func TestFullSnapshotDeletionDropsOverride(t *testing.T) {
 	}
 	if !n.r.overrides.get("b").live() || valueOf(t, n.sdk.URL, "b") != "false" {
 		t.Fatal("local_only override must survive the deletion")
+	}
+}
+
+// Codex r9: numbers match an existing variation semantically, and a live
+// source flag at version 0 removed by a full snapshot drops the override.
+func TestNumericVariationAndVersionZero(t *testing.T) {
+	src, _ := asObj(json.RawMessage(`{"key":"n","version":0,"on":true,"variations":[1.0,2],"offVariation":0,"fallthrough":{"variation":1},"targets":[],"rules":[],"prerequisites":[],"salt":"n"}`))
+	it := overriddenFlag("n", src, json.RawMessage(`1`), 1)
+	o, _ := asObj(it.Raw)
+	if string(o["variations"]) != `[1.0,2]` || string(o["fallthrough"]) != `{"variation":0}` {
+		t.Fatalf("variations %s fallthrough %s", o["variations"], o["fallthrough"])
+	}
+	st := newOverrideStore("", "me", newMetrics())
+	st.set("z", json.RawMessage(`true`), "", false, "", func() (map[string]uint64, map[string]bool) {
+		return map[string]uint64{"e": 0}, map[string]bool{}
+	})
+	ds, _ := parseDataSet([]byte(`{"flags":{"z":{"key":"z","version":0,"deleted":true}},"segments":{}}`))
+	if dropped := st.observe("e", ds, nil); len(dropped) != 1 {
+		t.Fatalf("version-0 flag removed by a snapshot: dropped %v", dropped)
 	}
 }
