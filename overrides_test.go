@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -813,5 +814,69 @@ func TestSourceChangeWinsWithClockAhead(t *testing.T) {
 	waitFor(t, "override dropped", func() bool { return !n.r.overrides.get("a").live() })
 	if v := valueOf(t, n.sdk.URL, "a"); v != "true" {
 		t.Fatalf("a = %s, want the source value", v)
+	}
+}
+
+// Codex r3 #1: reconciliation covers environments only on disk.
+func TestReplicatedOverrideCheckedAgainstDiskOnlyEnv(t *testing.T) {
+	dir := t.TempDir()
+	if err := seedCache(dir, testKey, []byte(dataJSON(flagJSON("a", 2, true)))); err != nil {
+		t.Fatal(err)
+	}
+	up := newMockUpstream(t, dataJSON(flagJSON("a", 2, true)))
+	up.down.Store(true)
+	n := startNode(t, testConfig(up.srv.URL, dir), nil, nil)
+	n.r.admin.adopt(overrideMap{"a": {Value: json.RawMessage(`false`), Rev: uint64(time.Now().UnixMilli()), Origin: "peer",
+		Upstream: map[string]uint64{keyHash(testKey): 1}}})
+	if n.r.overrides.get("a").live() {
+		t.Fatal("override older than the cached source must be dropped before any SDK asks")
+	}
+}
+
+// Codex r3 #3: in file mode a file edit never replaces an override.
+func TestFileModeOverrideSurvivesAddingTheFlag(t *testing.T) {
+	dir := t.TempDir()
+	f := filepath.Join(dir, "flags.yaml")
+	os.WriteFile(f, []byte("flags:\n  x: true\n"), 0o600)
+	s := newFileServer(f, "", filepath.Join(dir, "overrides.json"), testAdminToken, nil)
+	if err := s.rebuild(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.overrides.set("y", json.RawMessage(`"local"`), "", false, "", func() map[string]uint64 { return s.sourceVersions("y") }); err != nil {
+		t.Fatal(err)
+	}
+	s.applyOverrides([]string{"y"})
+	os.WriteFile(f, []byte("flags:\n  x: true\n  y: file\n"), 0o600)
+	if err := s.rebuild(); err != nil {
+		t.Fatal(err)
+	}
+	if !s.overrides.get("y").live() {
+		t.Fatal("adding the flag to the file dropped the override")
+	}
+	if it := s.view.Flags["y"]; !strings.Contains(string(it.Raw), `"variations":["local"]`) {
+		t.Fatalf("y served %s", it.Raw)
+	}
+}
+
+// Codex r3 #2: old tombstones are compacted instead of blocking replication.
+func TestTombstoneCompaction(t *testing.T) {
+	st := newOverrideStore("", "me", newMetrics())
+	old := uint64(time.Now().Add(-48 * time.Hour).UnixMilli())
+	in := overrideMap{}
+	for i := 0; i < maxTombstones+50; i++ {
+		in[fmt.Sprintf("k%d", i)] = &overrideRecord{Deleted: true, Rev: old + uint64(i), Origin: "p"}
+	}
+	in["live"] = &overrideRecord{Value: json.RawMessage(`1`), Rev: old + 1<<20, Origin: "p"}
+	st.merge(in)
+	if n := len(st.snapshot()); n > maxTombstones+1 {
+		t.Fatalf("%d records kept, want at most %d", n, maxTombstones+1)
+	}
+	if !st.get("live").live() {
+		t.Fatal("live record lost by compaction")
+	}
+	// Further merges still apply.
+	st.merge(overrideMap{"new": {Value: json.RawMessage(`2`), Rev: uint64(time.Now().UnixMilli()), Origin: "p"}})
+	if !st.get("new").live() {
+		t.Fatal("replication blocked after many tombstones")
 	}
 }

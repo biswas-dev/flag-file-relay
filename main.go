@@ -211,13 +211,13 @@ func (s *server) rebuild() error {
 	if len(ds.invalid) > 0 {
 		return fmt.Errorf("flags not servable: %v", ds.invalid)
 	}
-	s.overrides.observe("file", ds, func([]string) {
-		s.mu.Lock()
-		defer s.mu.Unlock()
-		s.rawJSON, s.raw, s.bump = b, ds, nil
-		s.setViewLocked(buildView(ds, s.overrides.snapshot(), nil))
-		s.broadcastLocked(putMsgsFor(s.payload, s.view))
-	})
+	// The file has no versions, so file changes never replace an override
+	// (unlike upstream mode): it stays until it is removed.
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.rawJSON, s.raw, s.bump = b, ds, nil
+	s.setViewLocked(buildView(ds, s.overrides.snapshot(), nil))
+	s.broadcastLocked(putMsgsFor(s.payload, s.view))
 	return nil
 }
 
@@ -268,13 +268,9 @@ func (s *server) applyOverrides(keys []string) {
 	}
 }
 
-// reconcile (overrideHost) checks the overrides against the file's flags.
-func (s *server) reconcile() []string {
-	s.mu.Lock()
-	raw := s.raw
-	s.mu.Unlock()
-	return s.overrides.observe("file", raw, nil)
-}
+// reconcile (overrideHost): file mode never drops an override for a file
+// change (the file has no versions).
+func (s *server) reconcile() []string { return nil }
 
 func (s *server) sourceVersions(key string) map[string]uint64 {
 	s.mu.Lock()

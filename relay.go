@@ -877,13 +877,28 @@ func (r *relay) adminEnvs() []adminEnv {
 
 // reconcile runs observe for every environment with data (an override merged
 // from a peer may be older than the source data held here).
+// Environments only on disk (no SDK has asked for them yet) are checked too:
+// they are served from that copy as soon as an SDK does.
 func (r *relay) reconcile() []string {
 	var dropped []string
+	seen := map[string]bool{}
 	for _, e := range r.envList() {
 		e.mu.Lock()
 		ds := e.data
 		e.mu.Unlock()
+		seen[e.hash] = true
 		dropped = append(dropped, r.overrides.observe(e.hash, ds, nil)...)
+	}
+	r.mu.Lock()
+	disk := map[string]*dataSet{}
+	for h, d := range r.disk {
+		if !seen[h] && r.byHash[h] == nil {
+			disk[h] = d.data
+		}
+	}
+	r.mu.Unlock()
+	for h, ds := range disk {
+		dropped = append(dropped, r.overrides.observe(h, ds, nil)...)
 	}
 	return dropped
 }

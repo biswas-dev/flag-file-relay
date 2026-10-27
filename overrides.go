@@ -55,6 +55,11 @@ const (
 	maxOverrideValue = 256 << 10
 	maxOverrideSetBy = 256
 	maxOverrides     = 10000
+	// Tombstones (removed overrides) beyond maxTombstones are compacted,
+	// oldest first, once they are older than tombstoneHorizon: by then every
+	// replica has long pulled them (peers sync every few seconds).
+	maxTombstones    = 10000
+	tombstoneHorizon = 24 * time.Hour
 )
 
 var flagKeyPattern = regexp.MustCompile(`^[A-Za-z0-9._-]{1,256}$`)
@@ -244,6 +249,7 @@ func (s *overrideStore) tick() uint64 {
 // and returns errPersist; otherwise next is served anyway and the write is
 // retried by retryLoop.
 func (s *overrideStore) publish(next overrideMap, strict bool) error {
+	compact(next)
 	if s.path != "" {
 		var err error
 		for attempt := 0; attempt < 3; attempt++ {
@@ -402,6 +408,9 @@ func (s *overrideStore) merge(in overrideMap) []string {
 			s.clock = o.Rev
 		}
 		mine := cur[k]
+		if mine == nil && o.Deleted && compactable(o) {
+			continue // a tombstone we compacted away: it changes nothing here
+		}
 		switch {
 		case o.newerThan(mine):
 			if next == nil {
@@ -440,10 +449,6 @@ func (s *overrideStore) merge(in overrideMap) []string {
 		}
 	}
 	if !dirty {
-		return nil
-	}
-	if len(next) > maxOverrides*2 {
-		log.Printf("overrides: peer state too large (%d records), ignored", len(next))
 		return nil
 	}
 	_ = s.publish(next, false)
@@ -760,4 +765,34 @@ func diffMsgs(old, view *dataSet, keys, must []string) [2][]byte {
 		}
 	}
 	return concatMsgs(parts...)
+}
+
+func compactable(o *overrideRecord) bool {
+	return o.Deleted && time.Since(time.UnixMilli(int64(o.Rev))) > tombstoneHorizon
+}
+
+// compact drops the oldest tombstones past the horizon while there are more
+// than maxTombstones, so removed overrides cannot grow the state forever.
+func compact(m overrideMap) {
+	var old []string
+	n := 0
+	for k, o := range m {
+		if o.Deleted {
+			n++
+			if compactable(o) {
+				old = append(old, k)
+			}
+		}
+	}
+	if n <= maxTombstones || len(old) == 0 {
+		return
+	}
+	sort.Slice(old, func(i, j int) bool { return m[old[i]].Rev < m[old[j]].Rev })
+	for _, k := range old {
+		if n <= maxTombstones {
+			break
+		}
+		delete(m, k)
+		n--
+	}
 }
