@@ -41,6 +41,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math/big"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -859,14 +860,54 @@ func diffMsgs(old, view *dataSet, keys, must []string) [2][]byte {
 	return concatMsgs(parts...)
 }
 
-// jsonEqual compares two JSON values semantically (key order, spacing, and
-// number spelling: 1.0 equals 1, as the SDKs compare them).
+// jsonEqual compares two JSON values semantically: key order, spacing, and
+// number spelling (1.0 equals 1), with numbers compared exactly (no float64
+// rounding: 9007199254740993 is not 9007199254740992).
 func jsonEqual(a, b json.RawMessage) bool {
 	var x, y interface{}
-	if json.Unmarshal(a, &x) != nil || json.Unmarshal(b, &y) != nil {
+	da, db := json.NewDecoder(bytes.NewReader(a)), json.NewDecoder(bytes.NewReader(b))
+	da.UseNumber()
+	db.UseNumber()
+	if da.Decode(&x) != nil || db.Decode(&y) != nil {
 		return false
 	}
-	xb, _ := json.Marshal(x)
-	yb, _ := json.Marshal(y)
-	return bytes.Equal(xb, yb)
+	return sameJSON(x, y)
+}
+
+func sameJSON(x, y interface{}) bool {
+	switch xv := x.(type) {
+	case json.Number:
+		yv, ok := y.(json.Number)
+		if !ok {
+			return false
+		}
+		rx, okx := new(big.Rat).SetString(string(xv))
+		ry, oky := new(big.Rat).SetString(string(yv))
+		return okx && oky && rx.Cmp(ry) == 0
+	case map[string]interface{}:
+		yv, ok := y.(map[string]interface{})
+		if !ok || len(xv) != len(yv) {
+			return false
+		}
+		for k, v := range xv {
+			w, ok := yv[k]
+			if !ok || !sameJSON(v, w) {
+				return false
+			}
+		}
+		return true
+	case []interface{}:
+		yv, ok := y.([]interface{})
+		if !ok || len(xv) != len(yv) {
+			return false
+		}
+		for i := range xv {
+			if !sameJSON(xv[i], yv[i]) {
+				return false
+			}
+		}
+		return true
+	default:
+		return x == y // string, bool, nil
+	}
 }

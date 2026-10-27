@@ -1019,3 +1019,19 @@ func TestNumericVariationAndVersionZero(t *testing.T) {
 		t.Fatalf("version-0 flag removed by a snapshot: dropped %v", dropped)
 	}
 }
+
+func TestJSONEqualExact(t *testing.T) {
+	for _, c := range []struct {
+		a, b string
+		eq   bool
+	}{
+		{`1`, `1.0`, true}, {`1e2`, `100`, true}, {`9007199254740992`, `9007199254740993`, false},
+		{`{"a":[1,{"b":9007199254740993}]}`, `{"a":[1.0,{"b":9007199254740993}]}`, true},
+		{`{"a":[1,{"b":9007199254740993}]}`, `{"a":[1,{"b":9007199254740992}]}`, false},
+		{`"1"`, `1`, false}, {`true`, `true`, true}, {`{"a":1}`, `{"a":1,"b":2}`, false},
+	} {
+		if got := jsonEqual(json.RawMessage(c.a), json.RawMessage(c.b)); got != c.eq {
+			t.Errorf("jsonEqual(%s, %s) = %v", c.a, c.b, got)
+		}
+	}
+}
