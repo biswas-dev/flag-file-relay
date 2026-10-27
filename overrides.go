@@ -55,6 +55,8 @@ const (
 	maxOverrideValue = 256 << 10
 	maxOverrideSetBy = 256
 	maxOverrides     = 10000
+	maxOverrideBytes = 16 << 20 // all live values together; fits a peer snapshot (maxPeerOverrides)
+	maxPeerOverrides = 64 << 20 // bytes read from a peer's override state
 	// Tombstones (removed overrides) beyond maxTombstones are compacted,
 	// oldest first, once they are older than tombstoneHorizon: by then every
 	// replica has long pulled them (peers sync every few seconds).
@@ -350,6 +352,15 @@ func (s *overrideStore) set(key string, value json.RawMessage, setBy string, loc
 	}
 	if !cur[key].live() && countLive(cur) >= maxOverrides {
 		return nil, errTooMany
+	}
+	total := len(bytes.TrimSpace(value))
+	for k, o := range cur {
+		if o.live() && k != key {
+			total += len(o.Value)
+		}
+	}
+	if total > maxOverrideBytes {
+		return nil, fmt.Errorf("%w: values would total %d bytes (limit %d)", errTooMany, total, maxOverrideBytes)
 	}
 	rec := &overrideRecord{
 		Value: append(json.RawMessage(nil), bytes.TrimSpace(value)...), SetBy: setBy, SetAt: time.Now().UTC(),

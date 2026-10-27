@@ -86,13 +86,14 @@ func (a *overrideAdmin) adopt(in overrideMap) {
 }
 
 type overrideAdmin struct {
-	store        *overrideStore
-	host         overrideHost
-	token        string
-	peers        *peerSet // nil: no replication
-	primaryAdmin string   // followers: the primary's admin base URL
-	client       *http.Client
-	metrics      *metrics
+	store         *overrideStore
+	host          overrideHost
+	token         string
+	peers         *peerSet     // nil: no replication
+	primaryAdmin  string       // followers: the primary's admin base URL
+	client        *http.Client // peer replication
+	forwardClient *http.Client // writes forwarded to the primary
+	metrics       *metrics
 }
 
 func adminToken() string { return strings.TrimSpace(envOr("RELAY_ADMIN_TOKEN", "")) }
@@ -103,7 +104,7 @@ func newOverrideAdmin(store *overrideStore, host overrideHost, token string, pee
 		token = ""
 	}
 	return &overrideAdmin{store: store, host: host, token: token, peers: peers, primaryAdmin: strings.TrimRight(primaryAdmin, "/"),
-		client: &http.Client{Timeout: 3 * time.Second}, metrics: m}
+		client: &http.Client{Timeout: 3 * time.Second}, forwardClient: &http.Client{}, metrics: m}
 }
 
 func (a *overrideAdmin) enabled() bool { return a != nil && a.token != "" }
@@ -450,7 +451,9 @@ func (a *overrideAdmin) forward(w http.ResponseWriter, req *http.Request, body [
 	if a.primaryAdmin == "" || req.Header.Get(hdrForwarded) != "" {
 		return false
 	}
-	ctx, cancel := context.WithTimeout(req.Context(), 5*time.Second)
+	// The primary persists and pushes to its peers (up to 3 s each) before
+	// it answers: allow for that.
+	ctx, cancel := context.WithTimeout(req.Context(), 15*time.Second)
 	defer cancel()
 	u := a.primaryAdmin + req.URL.Path
 	if req.URL.RawQuery != "" {
@@ -466,16 +469,22 @@ func (a *overrideAdmin) forward(w http.ResponseWriter, req *http.Request, body [
 		}
 	}
 	freq.Header.Set(hdrForwarded, "1")
-	resp, err := a.client.Do(freq)
+	resp, err := a.forwardClient.Do(freq)
 	if err != nil {
-		log.Printf("admin: primary unreachable (%v); applying %s %s here", err, req.Method, req.URL.Path)
-		return false
+		var op *net.OpError
+		if errors.As(err, &op) && op.Op == "dial" {
+			// Never reached the primary: it is down, apply the write here.
+			log.Printf("admin: primary unreachable (%v); applying %s %s here", err, req.Method, req.URL.Path)
+			return false
+		}
+		// The primary may have applied it: do not apply it twice; the client
+		// retries (with If-Match) and sees the outcome.
+		log.Printf("admin: forwarding %s %s to the primary failed: %v", req.Method, req.URL.Path, err)
+		writeJSONError(w, http.StatusGatewayTimeout, "primary did not answer; the write may have been applied, read the flag and retry")
+		a.metrics.inc("flagrelay_admin_requests_total", "code", "504")
+		return true
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode == http.StatusBadGateway || resp.StatusCode == http.StatusServiceUnavailable || resp.StatusCode == http.StatusGatewayTimeout {
-		log.Printf("admin: primary answered %d; applying %s %s here", resp.StatusCode, req.Method, req.URL.Path)
-		return false
-	}
 	rb, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
 	for _, h := range []string{"Content-Type", "ETag"} {
 		if v := resp.Header.Get(h); v != "" {
@@ -506,7 +515,7 @@ func (a *overrideAdmin) handlePeer(w http.ResponseWriter, req *http.Request) {
 		writeJSON(w, http.StatusOK, peerOverrides{Overrides: a.store.snapshot()})
 	case http.MethodPost:
 		var in peerOverrides
-		if err := json.NewDecoder(io.LimitReader(req.Body, 32<<20)).Decode(&in); err != nil {
+		if err := json.NewDecoder(io.LimitReader(req.Body, maxPeerOverrides)).Decode(&in); err != nil {
 			http.Error(w, "bad body", http.StatusBadRequest)
 			return
 		}
@@ -588,7 +597,7 @@ func (a *overrideAdmin) pull(ctx context.Context) int {
 				return
 			}
 			var in peerOverrides
-			if json.NewDecoder(io.LimitReader(resp.Body, 32<<20)).Decode(&in) != nil {
+			if json.NewDecoder(io.LimitReader(resp.Body, maxPeerOverrides)).Decode(&in) != nil {
 				return
 			}
 			mu.Lock()

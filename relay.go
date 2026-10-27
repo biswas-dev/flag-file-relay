@@ -707,6 +707,11 @@ func (r *relay) drain() {
 func (r *relay) start(ctx context.Context) {
 	r.syncDiskWithPeers(ctx)
 	r.admin.startupSync(ctx, r.cfg.peerSyncWait)
+	// Overrides and cached data are written separately: after a crash between
+	// the two, an override may predate the cached source. Check before serving.
+	if dropped := r.reconcile(); len(dropped) > 0 {
+		r.applyOverrides(dropped)
+	}
 	go r.diskRetryLoop(ctx)
 	go r.overrides.retryLoop(ctx.Done(), r.cfg.persistRetry)
 	go r.admin.syncLoop(ctx, r.cfg.overrideSync)

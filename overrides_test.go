@@ -880,3 +880,35 @@ func TestTombstoneCompaction(t *testing.T) {
 		t.Fatal("replication blocked after many tombstones")
 	}
 }
+
+// Codex r4 #1: an override persisted against an older version than the
+// cached source (crash between the two writes) is dropped at start.
+func TestStartupReconcilesOverridesWithCache(t *testing.T) {
+	dir := t.TempDir()
+	if err := seedCache(dir, testKey, []byte(dataJSON(flagJSON("a", 2, true)))); err != nil {
+		t.Fatal(err)
+	}
+	st := newOverrideStore(filepath.Join(dir, "overrides.json"), "old", newMetrics())
+	if _, err := st.set("a", json.RawMessage(`false`), "", false, "", func() map[string]uint64 { return map[string]uint64{keyHash(testKey): 1} }); err != nil {
+		t.Fatal(err)
+	}
+	up := newMockUpstream(t, dataJSON(flagJSON("a", 2, true)))
+	up.down.Store(true)
+	n := startNode(t, testConfig(up.srv.URL, dir), nil, nil)
+	if n.r.overrides.get("a").live() {
+		t.Fatal("stale override survived the restart")
+	}
+}
+
+// Codex r4 #3: the values together stay within what a peer snapshot carries.
+func TestOverrideAggregateLimit(t *testing.T) {
+	st := newOverrideStore("", "me", newMetrics())
+	big := json.RawMessage(`"` + strings.Repeat("x", maxOverrideValue-10) + `"`)
+	var err error
+	for i := 0; i < maxOverrideBytes/maxOverrideValue+2 && err == nil; i++ {
+		_, err = st.set(fmt.Sprintf("k%d", i), big, "", false, "", nil)
+	}
+	if err == nil {
+		t.Fatal("aggregate value size not bounded")
+	}
+}
