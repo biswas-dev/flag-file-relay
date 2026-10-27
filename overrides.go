@@ -57,11 +57,11 @@ const (
 	maxOverrides     = 10000
 	maxOverrideBytes = 16 << 20 // all live values together; fits a peer snapshot (maxPeerOverrides)
 	maxPeerOverrides = 64 << 20 // bytes read from a peer's override state
-	// Tombstones (removed overrides) beyond maxTombstones are compacted,
-	// oldest first, once they are older than tombstoneHorizon: by then every
-	// replica has long pulled them (peers sync every few seconds).
-	maxTombstones    = 10000
-	tombstoneHorizon = 24 * time.Hour
+	// maxRecords bounds the records (one per flag key ever overridden,
+	// removed ones included as tombstones). Tombstones are kept for good, so
+	// a replica that missed a deletion can never bring the override back;
+	// the cap is enforced on admin writes of a new key, never on merges.
+	maxRecords = 2 * maxOverrides
 )
 
 var flagKeyPattern = regexp.MustCompile(`^[A-Za-z0-9._-]{1,256}$`)
@@ -251,7 +251,6 @@ func (s *overrideStore) tick() uint64 {
 // and returns errPersist; otherwise next is served anyway and the write is
 // retried by retryLoop.
 func (s *overrideStore) publish(next overrideMap, strict bool) error {
-	compact(next)
 	if s.path != "" {
 		var err error
 		for attempt := 0; attempt < 3; attempt++ {
@@ -358,6 +357,9 @@ func (s *overrideStore) set(key string, value json.RawMessage, setBy string, loc
 	if !cur[key].live() && countLive(cur) >= maxOverrides {
 		return nil, errTooMany
 	}
+	if cur[key] == nil && len(cur) >= maxRecords {
+		return nil, fmt.Errorf("%w: %d flag keys have had overrides (limit %d)", errTooMany, len(cur), maxRecords)
+	}
 	total := len(bytes.TrimSpace(value))
 	for k, o := range cur {
 		if o.live() && k != key {
@@ -424,9 +426,6 @@ func (s *overrideStore) merge(in overrideMap) []string {
 			s.clock = o.Rev
 		}
 		mine := cur[k]
-		if mine == nil && o.Deleted && compactable(o) {
-			continue // a tombstone we compacted away: it changes nothing here
-		}
 		switch {
 		case o.newerThan(mine):
 			if next == nil {
@@ -781,34 +780,4 @@ func diffMsgs(old, view *dataSet, keys, must []string) [2][]byte {
 		}
 	}
 	return concatMsgs(parts...)
-}
-
-func compactable(o *overrideRecord) bool {
-	return o.Deleted && time.Since(time.UnixMilli(int64(o.Rev))) > tombstoneHorizon
-}
-
-// compact drops the oldest tombstones past the horizon while there are more
-// than maxTombstones, so removed overrides cannot grow the state forever.
-func compact(m overrideMap) {
-	var old []string
-	n := 0
-	for k, o := range m {
-		if o.Deleted {
-			n++
-			if compactable(o) {
-				old = append(old, k)
-			}
-		}
-	}
-	if n <= maxTombstones || len(old) == 0 {
-		return
-	}
-	sort.Slice(old, func(i, j int) bool { return m[old[i]].Rev < m[old[j]].Rev })
-	for _, k := range old {
-		if n <= maxTombstones {
-			break
-		}
-		delete(m, k)
-		n--
-	}
 }

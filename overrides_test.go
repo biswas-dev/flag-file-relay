@@ -858,26 +858,30 @@ func TestFileModeOverrideSurvivesAddingTheFlag(t *testing.T) {
 	}
 }
 
-// Codex r3 #2: old tombstones are compacted instead of blocking replication.
-func TestTombstoneCompaction(t *testing.T) {
+// Codex r3 #2 / r6 #2: many removed overrides never block replication, and
+// a deletion is never forgotten (no compaction); the key cap applies to
+// admin writes only.
+func TestManyTombstonesStillReplicate(t *testing.T) {
 	st := newOverrideStore("", "me", newMetrics())
-	old := uint64(time.Now().Add(-48 * time.Hour).UnixMilli())
 	in := overrideMap{}
-	for i := 0; i < maxTombstones+50; i++ {
-		in[fmt.Sprintf("k%d", i)] = &overrideRecord{Deleted: true, Rev: old + uint64(i), Origin: "p"}
+	for i := 0; i < maxRecords+50; i++ {
+		in[fmt.Sprintf("k%d", i)] = &overrideRecord{Deleted: true, Rev: uint64(1000 + i), Origin: "p"}
 	}
-	in["live"] = &overrideRecord{Value: json.RawMessage(`1`), Rev: old + 1<<20, Origin: "p"}
 	st.merge(in)
-	if n := len(st.snapshot()); n > maxTombstones+1 {
-		t.Fatalf("%d records kept, want at most %d", n, maxTombstones+1)
-	}
-	if !st.get("live").live() {
-		t.Fatal("live record lost by compaction")
-	}
-	// Further merges still apply.
 	st.merge(overrideMap{"new": {Value: json.RawMessage(`2`), Rev: uint64(time.Now().UnixMilli()), Origin: "p"}})
 	if !st.get("new").live() {
 		t.Fatal("replication blocked after many tombstones")
+	}
+	// A stale live record older than its deletion is refused.
+	st.merge(overrideMap{"k0": {Value: json.RawMessage(`true`), Rev: 999, Origin: "lagging"}})
+	if st.get("k0").live() {
+		t.Fatal("deletion forgotten")
+	}
+	if _, err := st.set("brand-new", json.RawMessage(`1`), "", false, "", nil); err == nil {
+		t.Fatal("admin write of a new key past the record cap must be refused")
+	}
+	if _, err := st.set("k1", json.RawMessage(`1`), "", false, "", nil); err != nil {
+		t.Fatalf("re-setting a known key must still work: %v", err)
 	}
 }
 

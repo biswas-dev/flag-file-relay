@@ -8,6 +8,10 @@ metadata:
   labels: { app: {{ .Release.Name }} }
 spec:
   replicas: {{ .Values.replicas }}
+  {{- if and .Values.admin.enabled .Values.persistence.existingClaim }}
+  strategy:
+    type: Recreate # never two pods writing the same overrides file
+  {{- end }}
   selector:
     matchLabels: { app: {{ .Release.Name }} }
   template:
