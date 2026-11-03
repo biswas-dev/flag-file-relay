@@ -54,7 +54,8 @@ type relayConfig struct {
 	eventsFlush       time.Duration
 	keepalive         time.Duration
 	writeTimeout      time.Duration
-	rejectTTL         time.Duration
+	rejectTTL         time.Duration // first wait after upstream refuses a key
+	rejectTTLMax      time.Duration // the wait doubles per refusal up to this
 	peerDNS           string
 	peerAddrs         []string // static peer host:port list (instead of peerDNS)
 	podIP             string
@@ -92,6 +93,7 @@ func loadRelayConfig() (relayConfig, error) {
 		keepalive:         envDur("KEEPALIVE", 20*time.Second),
 		writeTimeout:      envDur("WRITE_TIMEOUT", 10*time.Second),
 		rejectTTL:         envDur("REJECT_TTL", time.Minute),
+		rejectTTLMax:      envDur("REJECT_TTL_MAX", time.Hour),
 		peerDNS:           os.Getenv("PEER_DNS"),
 		podIP:             os.Getenv("POD_IP"),
 		primaryURI:        strings.TrimRight(os.Getenv("PRIMARY_URI"), "/"),
@@ -100,6 +102,7 @@ func loadRelayConfig() (relayConfig, error) {
 		peerSyncWait:      envDur("PEER_SYNC_WAIT", 10*time.Second),
 		persistRetry:      envDur("PERSIST_RETRY", 5*time.Second),
 	}
+	c.rejectTTLMax = max(c.rejectTTLMax, c.rejectTTL)
 	for _, a := range strings.Split(os.Getenv("PEER_ADDRS"), ",") {
 		if a = strings.TrimSpace(a); a != "" {
 			c.peerAddrs = append(c.peerAddrs, a)
@@ -165,7 +168,7 @@ type relay struct {
 	envs        map[string]*env        // by key
 	byHash      map[string]*env        // by sha256(key)
 	disk        map[string]*diskEntry  // by hash, loaded at start
-	rejected    map[string]time.Time   // by hash: upstream refused it recently
+	rejected    map[string]rejection   // by hash: upstream refused it recently
 	files       map[string]*sync.Mutex // by hash: serializes every write of that cache file
 	ready       atomic.Bool
 	draining    atomic.Bool
@@ -196,7 +199,7 @@ func newRelay(ctx context.Context, cfg relayConfig) *relay {
 		envs:         map[string]*env{},
 		byHash:       map[string]*env{},
 		disk:         loadCache(cfg.cacheDir),
-		rejected:     map[string]time.Time{},
+		rejected:     map[string]rejection{},
 		files:        map[string]*sync.Mutex{},
 	}
 	for h := range cfg.deny {
@@ -241,11 +244,12 @@ func (r *relay) envFor(req *http.Request) (*env, *errStatus) {
 			r.mu.Unlock()
 			return nil, &errStatus{http.StatusUnauthorized, "SDK key not accepted by this relay"}
 		}
-		if t, ok := r.rejected[h]; ok && time.Since(t) < r.cfg.rejectTTL {
+		if rj, ok := r.rejected[h]; ok && time.Now().Before(rj.until()) {
 			r.mu.Unlock()
 			return nil, &errStatus{http.StatusServiceUnavailable, "SDK key not accepted upstream; retry later"}
 		}
-		delete(r.rejected, h)
+		// An expired entry stays: if upstream refuses the key again, the
+		// next wait is twice as long (cleared once the key works).
 		if len(r.envs) >= r.cfg.maxKeys {
 			r.mu.Unlock()
 			return nil, &errStatus{http.StatusServiceUnavailable, "too many SDK keys (MAX_KEYS)"}
@@ -273,19 +277,47 @@ func (r *relay) forget(e *env) {
 		delete(r.envs, e.key)
 		delete(r.byHash, e.hash)
 	}
+	ttl := r.nextRejectTTL(e.hash)
 	// Bounded negative cache.
 	if len(r.rejected) >= 1024 {
-		for h, t := range r.rejected {
-			if time.Since(t) >= r.cfg.rejectTTL {
+		for h, rj := range r.rejected {
+			if time.Since(rj.until()) >= r.cfg.rejectTTLMax {
 				delete(r.rejected, h)
 			}
 		}
 	}
 	if len(r.rejected) < 1024 {
-		r.rejected[e.hash] = time.Now()
+		r.rejected[e.hash] = rejection{at: time.Now(), ttl: ttl}
 	}
 	e.cancel()
-	log.Printf("env %s: upstream refused the SDK key; negative-cached for %s", e.id, r.cfg.rejectTTL)
+	log.Printf("env %s: upstream refused the SDK key; negative-cached for %s", e.id, ttl)
+}
+
+// rejection is one negative-cache entry: upstream refused the key at `at`,
+// and the relay does not ask upstream again for `ttl`.
+type rejection struct {
+	at  time.Time
+	ttl time.Duration
+}
+
+func (rj rejection) until() time.Time { return rj.at.Add(rj.ttl) }
+
+// nextRejectTTL is the wait after one more refusal of the key: REJECT_TTL
+// the first time, then doubled per refusal up to REJECT_TTL_MAX. A relay with
+// a wrong key must not ask upstream every minute forever. Under r.mu.
+func (r *relay) nextRejectTTL(hash string) time.Duration {
+	rj, ok := r.rejected[hash]
+	if !ok {
+		return r.cfg.rejectTTL
+	}
+	return min(2*rj.ttl, r.cfg.rejectTTLMax)
+}
+
+// keyAccepted clears the key's refusal history once upstream serves it.
+func (r *relay) keyAccepted(hash string) {
+	r.mu.Lock()
+	delete(r.rejected, hash)
+	r.mu.Unlock()
 }
 
 // knownKey reports whether events for this key may be forwarded.

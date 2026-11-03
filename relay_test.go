@@ -30,6 +30,7 @@ type mockUpstream struct {
 	bulkHdr []http.Header
 	opens   atomic.Int64
 	polls   atomic.Int64
+	refused atomic.Int64 // requests answered 401
 	down    atomic.Bool
 	srv     *httptest.Server
 	// staleFirst, if set, is sent as the first stream's put after a delay
@@ -51,6 +52,7 @@ func (m *mockUpstream) serve(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if r.Header.Get("Authorization") != testKey {
+		m.refused.Add(1)
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
@@ -150,7 +152,7 @@ func testConfig(upstream, cacheDir string) relayConfig {
 		initWait: 500 * time.Millisecond, firstWait: 2 * time.Second,
 		drainDelay: 0, drainSpread: 200 * time.Millisecond,
 		readTimeout: 5 * time.Second, pollInterval: 200 * time.Millisecond,
-		eventsFlush: 100 * time.Millisecond, keepalive: time.Second, rejectTTL: time.Minute,
+		eventsFlush: 100 * time.Millisecond, keepalive: time.Second, rejectTTL: time.Minute, rejectTTLMax: time.Hour,
 		reconcileInterval: time.Hour, writeTimeout: 5 * time.Second, maxStreams: 1000,
 		primaryRetry: time.Second, idleExpiry: time.Minute, peerSyncWait: 2 * time.Second,
 		persistRetry: 200 * time.Millisecond,
@@ -305,6 +307,49 @@ func TestAuth(t *testing.T) {
 	}
 	if code, _, _ := get(t, srv.URL+"/sdk/latest-all", "Bearer "+testKey); code != 200 {
 		t.Fatalf("bearer key: %d", code)
+	}
+}
+
+// A relay with a wrong key must not ask upstream at a fixed rate forever:
+// every refusal doubles the wait, up to REJECT_TTL_MAX.
+func TestRefusedKeyBacksOff(t *testing.T) {
+	up := newMockUpstream(t, dataJSON(flagJSON("a", 1, true)))
+	cfg := testConfig(up.srv.URL, "")
+	cfg.rejectTTL, cfg.rejectTTLMax = 50*time.Millisecond, 400*time.Millisecond
+	r, srv, _ := startRelay(t, cfg)
+	// An SDK that keeps asking, as the blue-stack services do.
+	deadline := time.Now().Add(1600 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		get(t, srv.URL+"/sdk/latest-all", "sdk-srv-wrong")
+		time.Sleep(10 * time.Millisecond)
+	}
+	// Fixed 50 ms would be ~30 refusals; doubling (50,100,200,400,400) ~6.
+	if n := up.refused.Load(); n < 3 || n > 9 {
+		t.Fatalf("upstream refused %d requests; want a backed-off handful", n)
+	}
+	r.mu.Lock()
+	ttl := r.rejected[keyHash("sdk-srv-wrong")].ttl
+	r.mu.Unlock()
+	if ttl != cfg.rejectTTLMax {
+		t.Fatalf("wait after repeated refusals = %s, want the cap %s", ttl, cfg.rejectTTLMax)
+	}
+}
+
+func TestNextRejectTTL(t *testing.T) {
+	r := &relay{cfg: relayConfig{rejectTTL: time.Minute, rejectTTLMax: time.Hour}, rejected: map[string]rejection{}}
+	var got []time.Duration
+	for range 8 {
+		ttl := r.nextRejectTTL("h")
+		r.rejected["h"] = rejection{at: time.Now(), ttl: ttl}
+		got = append(got, ttl)
+	}
+	want := []time.Duration{time.Minute, 2 * time.Minute, 4 * time.Minute, 8 * time.Minute, 16 * time.Minute, 32 * time.Minute, time.Hour, time.Hour}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+	r.keyAccepted("h")
+	if ttl := r.nextRejectTTL("h"); ttl != time.Minute {
+		t.Fatalf("after success: %s, want the first wait again", ttl)
 	}
 }
 
