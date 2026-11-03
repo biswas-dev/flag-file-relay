@@ -99,6 +99,7 @@ type env struct {
 	failures    int
 	triedOnce   bool
 	authFailed  bool
+	authUntil   time.Time // refused key with cached data: no upstream calls before this
 	peersTried  bool
 	lastErr     string
 
@@ -368,6 +369,7 @@ func (e *env) pickTarget() target {
 func (e *env) streamLoop(ctx context.Context) {
 	const base, max = time.Second, 30 * time.Second
 	delay := base
+	var authDelay time.Duration // grows per refusal while we serve cached data
 	staleRetries := 0
 	for ctx.Err() == nil {
 		t := e.pickTarget()
@@ -414,7 +416,22 @@ func (e *env) streamLoop(ctx context.Context) {
 				e.r.forget(e)
 				return
 			}
-			log.Printf("env %s: upstream rejected the key; keeping the cached data and retrying", e.id)
+			// Same doubling as the negative cache: a wrong key must not
+			// call upstream every 30 s for as long as the cache lasts.
+			if authDelay = 2 * authDelay; authDelay == 0 {
+				authDelay = e.r.cfg.rejectTTL
+			}
+			authDelay = min(authDelay, e.r.cfg.rejectTTLMax)
+			e.mu.Lock()
+			e.authUntil = time.Now().Add(authDelay)
+			e.mu.Unlock()
+			log.Printf("env %s: upstream rejected the key; keeping the cached data and retrying in %s", e.id, authDelay)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(authDelay):
+			}
+			continue
 		} else if err != nil {
 			e.r.metrics.inc("flagrelay_upstream_errors_total", "env", e.id, "kind", "stream")
 			log.Printf("env %s: upstream stream ended: %v", e.id, err)
@@ -749,8 +766,9 @@ func (e *env) applyPutChecked(ds *dataSet, src string, confirmed time.Time, from
 		return false, putDropped
 	}
 	cur, curSrc := e.data, e.source
-	e.failures, e.triedOnce, e.authFailed = 0, true, false
+	e.failures, e.triedOnce, e.authFailed, e.authUntil = 0, true, false, time.Time{}
 	e.mu.Unlock()
+	e.r.keyAccepted(e.hash)
 
 	if len(ds.invalid) > 0 {
 		e.r.metrics.add("flagrelay_invalid_items_total", float64(len(ds.invalid)), "env", e.id)
@@ -827,7 +845,7 @@ func (e *env) applyPeerSnapshot(ds *dataSet, confirmed time.Time) {
 func (e *env) reconcileLoop(ctx context.Context) {
 	for {
 		e.mu.Lock()
-		connected, failed := e.connected, e.authFailed
+		connected, failed := e.connected, e.authFailed || time.Now().Before(e.authUntil)
 		e.mu.Unlock()
 		base := e.r.cfg.reconcileInterval
 		if !connected {
