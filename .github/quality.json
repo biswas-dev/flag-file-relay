@@ -1,0 +1,18 @@
+{
+  "repo": "flag-file-relay",
+  "components": {
+    "application": {
+      "repo": "flag-file-relay",
+      "file": "coverage.out",
+      "language": "go",
+      "root": "",
+      "token": "COVERAGE_TOKEN",
+      "label": "Application",
+      "module": "github.com/biswas-dev/flag-file-relay"
+    }
+  },
+  "workflows": [
+    ".github/workflows/security.yml",
+    ".github/workflows/ci.yml"
+  ]
+}
