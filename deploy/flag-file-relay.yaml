@@ -49,12 +49,21 @@ spec:
     metadata:
       labels: { app: flag-file-relay }
     spec:
+      securityContext:
+        # Numeric ids: older images name the user (relay, uid 1001), which runAsNonRoot can't verify.
+        runAsNonRoot: true
+        runAsUser: 1001
+        runAsGroup: 1001
       containers:
         - name: flag-file-relay
           # Load this image into the customer's private registry first
           # (it must not be pulled from any external host in an air-gapped env).
           image: docker.io/anchoo2kewl/flag-file-relay:v0.1.0
           args: ["serve"]
+          # No CACHE_DIR here, so the relay writes nothing to disk.
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
           env:
             - { name: FLAGS_FILE, value: /etc/flags/flags.yaml }
             - { name: PORT, value: "8080" }

@@ -29,6 +29,10 @@ spec:
         - name: relay
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
+          # The relay writes only under CACHE_DIR (the data volume), never the image.
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
           args: ["serve"]
           env:
             - { name: FLAGS_FILE, value: /etc/flags/flags.yaml }
